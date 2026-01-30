@@ -1,8 +1,9 @@
 # adapters.py
 import os
 import asyncio
+import threading
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union, Sequence
 
 
 SENTINEL_MODEL = "concepts-default"
@@ -18,19 +19,27 @@ HF_MODELS_MAP: Dict[str, str] = {
     # add more if you want
 }
 
+# Your llm.py uses OpenAI-style "input" payloads.
+# One prompt:  input_payload = [{"role":"user","content":[{"type":"input_text","text":"..."}]}]
+# Batch:       input_payloads = [input_payload1, input_payload2, ...]
+InputPayload = List[Dict[str, Any]]
+BatchInputPayload = List[InputPayload]
 
-def _extract_user_text(input_payload: List[Dict[str, Any]]) -> str:
+
+def _extract_user_text(input_payload: InputPayload) -> str:
     """
     Your llm.py sends:
       input=[{"role":"user","content":[{"type":"input_text","text": "..."}]}]
     This pulls the text out in a provider-agnostic way.
     """
     try:
+        if not input_payload:
+            return ""
         content = input_payload[0].get("content", [])
-        parts = []
+        parts: List[str] = []
         for p in content:
             if isinstance(p, dict) and "text" in p:
-                parts.append(p["text"])
+                parts.append(str(p["text"]))
             elif isinstance(p, str):
                 parts.append(p)
         return "\n".join(parts).strip()
@@ -70,7 +79,7 @@ class _OpenAIResponses:
         self._client = client
         self._provider = provider_name
 
-    async def create(self, *, model: str, instructions: str, input: List[Dict[str, Any]], **kwargs):
+    async def create(self, *, model: str, instructions: str, input: InputPayload, **kwargs):
         model = _resolve_model(self._provider, model)
         resp = await self._client.responses.create(
             model=model,
@@ -97,7 +106,7 @@ class _AnthropicResponses:
         self._client = client
         self._provider = provider_name
 
-    async def create(self, *, model: str, instructions: str, input: List[Dict[str, Any]], **kwargs):
+    async def create(self, *, model: str, instructions: str, input: InputPayload, **kwargs):
         model = _resolve_model(self._provider, model)
         user_text = _extract_user_text(input)
         max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", "800"))
@@ -136,11 +145,16 @@ class AnthropicCompatClient:
 class _HFLocalEngine:
     """
     Lazy-load a transformers text-generation pipeline once.
+
+    Supports:
+      - generate(system, user) -> str
+      - generate_many(system, [user1, user2, ...]) -> List[str]  (batched pipeline call)
     """
     def __init__(self, model_id: str):
         self.model_id = model_id
         self.pipe = None
         self.tok = None
+        self._lock = threading.Lock()  # HF pipelines are not thread-safe (esp. on GPU)
 
     def load(self):
         if self.pipe is not None:
@@ -154,6 +168,20 @@ class _HFLocalEngine:
             use_fast=True,
             token=hf_token,
         )
+
+        # ✅ FIX: decoder-only models + batching need LEFT padding
+        try:
+            self.tok.padding_side = "left"
+        except Exception:
+            pass
+
+        # Ensure pad token exists for batching/padding
+        if getattr(self.tok, "pad_token_id", None) is None and getattr(self.tok, "eos_token_id", None) is not None:
+            try:
+                self.tok.pad_token = self.tok.eos_token
+            except Exception:
+                pass
+
         force_cpu = os.getenv("HF_FORCE_CPU", "0") == "1"
 
         if force_cpu:
@@ -168,7 +196,7 @@ class _HFLocalEngine:
                 model=mdl,
                 tokenizer=self.tok,
                 device=-1,  # CPU
-                pad_token_id=self.tok.eos_token_id,
+                pad_token_id=getattr(self.tok, "eos_token_id", None),
             )
         else:
             mdl = AutoModelForCausalLM.from_pretrained(
@@ -181,37 +209,118 @@ class _HFLocalEngine:
                 "text-generation",
                 model=mdl,
                 tokenizer=self.tok,
-                pad_token_id=self.tok.eos_token_id,
+                pad_token_id=getattr(self.tok, "eos_token_id", None),
             )
 
 
     def format_prompt(self, system: str, user: str) -> str:
-        # Simple instruct template. Works for many instruct models.
+        """
+        Prefer tokenizer chat template when available (correct for Llama/Qwen instruct),
+        otherwise fall back to your simple template.
+        """
+        self.load()
+        assert self.tok is not None
+
+        # Newer tokenizers for instruct models typically support this:
+        if hasattr(self.tok, "apply_chat_template"):
+            try:
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+                return self.tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+
+        # Fallback: your original simple instruct template
         return (
             f"<|system|>\n{system}\n<|end|>\n"
             f"<|user|>\n{user}\n<|end|>\n<|assistant|>\n"
         )
 
-    def generate(self, system: str, user: str) -> str:
+    def _pipe_call(self, prompts: Union[str, List[str]], **gen_kwargs) -> Any:
+        """
+        Calls the pipeline in a lock to avoid concurrent GPU/CPU pipeline usage.
+        Tries to request return_full_text=False to get only the completion.
+        """
+        assert self.pipe is not None
+
+        # Try to get only the generated continuation (much easier to post-process)
+        try:
+            return self.pipe(prompts, return_full_text=False, **gen_kwargs)
+        except TypeError:
+            # Older transformers may not support return_full_text in this pipeline call
+            return self.pipe(prompts, **gen_kwargs)
+
+    def _normalize_outputs(self, outputs: Any, prompts: Optional[Sequence[str]] = None) -> List[str]:
+        """
+        Normalize pipeline outputs to List[str] completions.
+        Handles:
+          - list[dict]
+          - list[list[dict]] (when num_return_sequences>1)
+        """
+        texts: List[str] = []
+
+        if outputs is None:
+            return texts
+
+        # If batch
+        if isinstance(outputs, list):
+            for item in outputs:
+                if isinstance(item, list) and item:
+                    # num_return_sequences case: take first
+                    item = item[0]
+                if isinstance(item, dict) and "generated_text" in item:
+                    texts.append(str(item["generated_text"]))
+                else:
+                    texts.append(str(item))
+            return [t.strip() for t in texts]
+
+        # Single weird case
+        if isinstance(outputs, dict) and "generated_text" in outputs:
+            return [str(outputs["generated_text"]).strip()]
+
+        return [str(outputs).strip()]
+
+    def generate_many(self, system: str, users: List[str]) -> List[str]:
+        """
+        Batched generation: one pipeline call with list[str].
+        """
         self.load()
-        prompt = self.format_prompt(system, user)
+        assert self.pipe is not None
+
+        prompts = [self.format_prompt(system, u) for u in users]
 
         max_new_tokens = int(os.getenv("HF_MAX_NEW_TOKENS", "512"))
         temperature = float(os.getenv("HF_TEMPERATURE", "0.1"))
         top_p = float(os.getenv("HF_TOP_P", "1.0"))
+        batch_size = int(os.getenv("HF_BATCH_SIZE", "4"))
 
-        out = self.pipe(
-            prompt,
+        gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=(temperature > 0),
-        )[0]["generated_text"]
+            batch_size=batch_size,
+            pad_token_id=getattr(self.tok, "eos_token_id", None),
+        )
 
-        # Return only assistant portion if present
-        if "<|assistant|>" in out:
-            return out.split("<|assistant|>", 1)[-1].strip()
-        return out.strip()
+        with self._lock:
+            outputs = self._pipe_call(prompts, **gen_kwargs)
+
+        texts = self._normalize_outputs(outputs, prompts=prompts)
+        return texts
+
+    def generate(self, system: str, user: str) -> str:
+        """
+        Single generation (still uses the same pipeline).
+        """
+        texts = self.generate_many(system, [user])
+        return texts[0].strip() if texts else ""
 
 
 class _HFResponses:
@@ -230,16 +339,73 @@ class _HFResponses:
             self._model_id = model_id
             self._engine = _HFLocalEngine(model_id=model_id)
 
-    async def create(self, *, model: str, instructions: str, input: List[Dict[str, Any]], **kwargs):
-        self._ensure_engine(model)
-        user_text = _extract_user_text(input)
+    async def create(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        input: Union[InputPayload, BatchInputPayload],
+        **kwargs,
+    ):
+        """
+        HF batching support:
 
-        # Run generation in a thread so async code doesn't block the event loop
-        def _run():
-            assert self._engine is not None
+        1) Single prompt (existing behavior):
+             input = [{"role":"user","content":[{"type":"input_text","text":"..."}]}]
+           returns: SimpleNamespace(output_text="...")
+
+        2) Batch prompts (NEW):
+             input = [input_payload1, input_payload2, ...]
+           returns: SimpleNamespace(output_texts=[...], output_text="first item")
+           (output_text kept for backward-compat; use output_texts for the batch.)
+        """
+        self._ensure_engine(model)
+        assert self._engine is not None
+
+        # Optional escape hatch that mirrors HF docs naming:
+        # client.responses.create(..., text_inputs=[...])  (HF only)
+        text_inputs = kwargs.pop("text_inputs", None)
+        if text_inputs is not None:
+            if isinstance(text_inputs, str):
+                user_texts = [text_inputs]
+            elif isinstance(text_inputs, list):
+                user_texts = [str(x) for x in text_inputs]
+            else:
+                user_texts = [str(text_inputs)]
+
+            def _run_text_inputs():
+                return self._engine.generate_many(instructions, user_texts)
+
+            texts = await asyncio.to_thread(_run_text_inputs)
+            return SimpleNamespace(
+                output_texts=[t.strip() for t in texts],
+                output_text=(texts[0].strip() if texts else ""),
+            )
+
+        # Detect batch: input is a list whose first element is itself a list (payload)
+        is_batch = bool(input) and isinstance(input, list) and isinstance(input[0], list)
+
+        if is_batch:
+            payloads: BatchInputPayload = input  # type: ignore[assignment]
+            user_texts = [_extract_user_text(p) for p in payloads]
+
+            def _run_batch():
+                return self._engine.generate_many(instructions, user_texts)
+
+            texts = await asyncio.to_thread(_run_batch)
+            return SimpleNamespace(
+                output_texts=[t.strip() for t in texts],
+                output_text=(texts[0].strip() if texts else ""),
+            )
+
+        # Single prompt
+        payload: InputPayload = input  # type: ignore[assignment]
+        user_text = _extract_user_text(payload)
+
+        def _run_one():
             return self._engine.generate(instructions, user_text)
 
-        text = await asyncio.to_thread(_run)
+        text = await asyncio.to_thread(_run_one)
         return SimpleNamespace(output_text=text.strip())
 
 

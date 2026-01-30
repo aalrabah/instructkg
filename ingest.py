@@ -64,7 +64,8 @@ def write_jsonl(records: List[Dict[str, Any]], out_path: str) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def ingest_pdfs(pdf_paths: List[str], out_name: str = "chunks.jsonl") -> str:
+def ingest_pdfs(pdf_paths: List[str], out_name: str = "chunks.jsonl", out_dir: str = OUT_DIR) -> str:
+
     import re
     from pathlib import Path
 
@@ -100,7 +101,8 @@ def ingest_pdfs(pdf_paths: List[str], out_name: str = "chunks.jsonl") -> str:
         print(f"   -> {len(recs)} chunks")
         all_records.extend(recs)
 
-    out_path = str(Path(OUT_DIR) / out_name)
+    out_path = str(Path(out_dir) / out_name)
+
     write_jsonl(all_records, out_path)
     print(f"✅ Wrote {len(all_records)} chunks to: {out_path}")
     return out_path
@@ -109,10 +111,11 @@ def ingest_pdfs(pdf_paths: List[str], out_name: str = "chunks.jsonl") -> str:
 
 if __name__ == "__main__":
     # Example: put PDFs in a folder named "data/"
-    data_dir = Path("data")
+    data_dir = Path("data/algo")
     pdfs = sorted([str(p) for p in data_dir.glob("*.pdf")])
 
     if not pdfs:
         raise SystemExit("❌ No PDFs found. Put your PDFs in ./data/")
 
     ingest_pdfs(pdfs)
+

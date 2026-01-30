@@ -61,14 +61,9 @@ async def run_llm_and_cards(
     mentions_out: str,
     concept_cards_out: str,
     model: str,
+    batch_size: int = 8,  # NEW: accept batch_size parameter
     progress_every: int = 25,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    LLM step with progress prints:
-      - per-chunk progress (every N chunks)
-      - shows how many concepts were extracted + how many mentions were produced
-    """
-
     import os
     import time
 
@@ -86,54 +81,98 @@ async def run_llm_and_cards(
     skipped_empty = 0
     t0 = time.time()
 
-    for i, ch in enumerate(chunks, 1):
-        chunk_id = ch.get("chunk_id")
-        lecture_id = ch.get("lecture_id")
-        text = (ch.get("text") or "").strip()
+    # ✅ Use the passed batch_size parameter
+    chunk_batch = batch_size
+    print(f"[llm] chunk_batch={chunk_batch}")
 
-        if not text:
-            skipped_empty += 1
+    i = 0
+    while i < total_chunks:
+        batch = chunks[i : i + chunk_batch]
+
+        # Keep alignment with original indices for progress/debug
+        batch_items: List[Tuple[int, Dict[str, Any], str]] = []
+        for j, ch in enumerate(batch):
+            global_i = i + j + 1
+            text = (ch.get("text") or "").strip()
+            if not text:
+                skipped_empty += 1
+                continue
+            batch_items.append((global_i, ch, text))
+
+        # Nothing to do in this batch
+        if not batch_items:
+            i += chunk_batch
             continue
 
-        processed += 1
+        texts = [t for (_, _, t) in batch_items]
 
-        # 1) extract concepts for this chunk
-        concepts = await llm.extract_concepts_llm(client, text=text, model=model)
+        # ✅ 1 call for concept extraction (HF batched)
+        concepts_lists = await llm.extract_concepts_llm_batch(client, texts=texts, model=model)
 
-        # 2) classify role + snippet per concept
-        before = len(mentions)
-        for c in concepts:
-            tag = await llm.classify_concept_role_llm(client, text=text, concept=c, model=model)
-            if tag is None:
+        # Build all (chunk, concept) prompts for role classification in ONE batch call
+        role_prompts: List[str] = []
+        role_meta: List[Tuple[int, str]] = []  # (batch_item_index, concept)
+        for bi, concepts in enumerate(concepts_lists):
+            if not concepts:
                 continue
-            mentions.append(
-                {
-                    "concept_id": llm.concept_to_id(c),
-                    "concept": c,
-                    "lecture_id": lecture_id,
-                    "chunk_id": chunk_id,
-                    "chunk_index": ch.get("chunk_index", i - 1),
-                    "page_numbers": ch.get("page_numbers") or [],
-                    "role": (tag.get("role") or "").lower(),
-                    "snippet": (tag.get("snippet") or "").strip(),
-                }
-            )
-        added = len(mentions) - before
+            _, _, text = batch_items[bi]
+            for c in concepts:
+                role_prompts.append(f"CHUNK:\n{text}\n\nCONCEPT:\n{c}")
+                role_meta.append((bi, c))
 
-        # progress print
-        if progress_every and (i == 1 or i % progress_every == 0 or i == total_chunks):
-            elapsed = time.time() - t0
-            print(
-                f"[llm] {i}/{total_chunks} chunk_id={chunk_id} "
-                f"concepts={len(concepts)} mentions+={added} total_mentions={len(mentions)} "
-                f"(processed={processed}, skipped_empty={skipped_empty}, {elapsed:.1f}s)"
-            )
+        # ✅ 1 call for ALL role classifications (HF batched)
+        role_tags = await llm.classify_concept_role_llm_batch_texts(client, role_prompts, model=model) if role_prompts else []
 
-    # write mentions
+        # Reassemble tags per chunk item
+        per_item_tags: List[List[Tuple[str, Dict[str, str]]]] = [[] for _ in batch_items]
+        for (bi, c), tag in zip(role_meta, role_tags):
+            per_item_tags[bi].append((c, tag))
+
+        # Emit mentions (same schema as before)
+        for bi, (global_i, ch, text) in enumerate(batch_items):
+            chunk_id = ch.get("chunk_id")
+            lecture_id = ch.get("lecture_id")
+
+            processed += 1
+            before = len(mentions)
+
+            concepts = concepts_lists[bi] if bi < len(concepts_lists) else []
+            tags_for_item = per_item_tags[bi]
+
+            # keep original order by concepts list
+            tag_map = {c: tag for (c, tag) in tags_for_item}
+
+            for c in concepts:
+                tag = tag_map.get(c, {"role": "na", "snippet": ""})
+                mentions.append(
+                    {
+                        "concept_id": llm.concept_to_id(c),
+                        "concept": c,
+                        "lecture_id": lecture_id,
+                        "chunk_id": chunk_id,
+                        "chunk_index": ch.get("chunk_index", global_i - 1),
+                        "page_numbers": ch.get("page_numbers") or [],
+                        "role": (tag.get("role") or "na").lower(),
+                        "snippet": (tag.get("snippet") or "").strip(),
+                        "chunk_text": text,
+                    }
+                )
+
+            added = len(mentions) - before
+
+            if progress_every and (global_i == 1 or global_i % progress_every == 0 or global_i == total_chunks):
+                elapsed = time.time() - t0
+                print(
+                    f"[llm] {global_i}/{total_chunks} chunk_id={chunk_id} "
+                    f"concepts={len(concepts)} mentions+={added} total_mentions={len(mentions)} "
+                    f"(processed={processed}, skipped_empty={skipped_empty}, {elapsed:.1f}s)"
+                )
+
+        i += chunk_batch
+
     write_jsonl(mentions_out, mentions)
     print(f"✅ Wrote mentions: {mentions_out} (records={len(mentions)})")
 
-    # concept cards
     print(f"[llm] building concept_cards from mentions...")
     chunk_concepts = build_chunk_concepts_from_mentions(mentions)
     cards = llm.build_concept_cards(mentions, chunk_concepts)
@@ -141,6 +180,7 @@ async def run_llm_and_cards(
     print(f"✅ Wrote concept_cards: {concept_cards_out} (concepts={len(cards)})")
 
     return mentions, cards
+
 
 
 
@@ -154,7 +194,7 @@ def run_clustering(
     mentions_path: str,
     clusters_out: str,
     embedding_model: str,
-    batch_size: int,
+    embedding_batch_size: int,  # RENAMED from batch_size
     umap_components: int,
     min_contexts_to_cluster: int,
     min_cluster_size: Optional[int],
@@ -162,42 +202,29 @@ def run_clustering(
     top_terms: int,
     progress_every: int,
 ) -> None:
+    # Load inputs
     chunks = read_jsonl(chunks_path)
     mentions = read_jsonl(mentions_path)
 
-    chunks_by_id = clustering.build_chunks_index(chunks)
-    concept_to_chunk_ids = clustering.build_concept_to_chunk_ids(mentions)
+    recs = clustering.cluster_global_chunks(
+        chunks=chunks,
+        mentions=mentions,
+        embedding_model=embedding_model,
+        batch_size=embedding_batch_size,  # Use embedding_batch_size
+        normalize_embeddings=True,
+        use_umap=True,
+        umap_neighbors=15,
+        umap_components=umap_components,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        top_terms=top_terms,
+        top_k_concept_role=3,          # ✅ top-3 tuples
+        top_k_chunks_per_cluster=2,    # ✅ top-2 chunk texts
+    )
 
-    out: List[Dict[str, Any]] = []
-    concept_ids = sorted(concept_to_chunk_ids.keys())
-    total = len(concept_ids)
+    write_jsonl(clusters_out, recs)
+    print(f"✅ Wrote GLOBAL clusters: {clusters_out} (clusters={len(recs)})")
 
-    for i, concept_id in enumerate(concept_ids, 1):
-        chunk_ids = concept_to_chunk_ids[concept_id]
-        kept_chunk_ids, texts = clustering.concept_context_texts(concept_id, chunk_ids, chunks_by_id)
-
-        rec = clustering.cluster_concept(
-            concept_id=concept_id,
-            texts=texts,
-            chunk_ids=kept_chunk_ids,
-            embedding_model=embedding_model,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            use_umap=True,                 # in your file this is "enable clustering"
-            umap_neighbors=15,             # unused in your PCA path, but harmless
-            umap_components=umap_components,
-            min_contexts_to_cluster=min_contexts_to_cluster,
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
-            top_terms=top_terms,
-        )
-        out.append(rec)
-
-        if progress_every and (i == 1 or i % progress_every == 0 or i == total):
-            print(f"[clustering] {i}/{total} concept_id={concept_id}")
-
-    write_jsonl(clusters_out, out)
-    print(f"✅ Wrote clusters+assignments: {clusters_out} (concepts={len(out)})")
 
 
 # ----------------------------
@@ -255,20 +282,27 @@ def run_pairpackets_final(
     )
     print(f"✅ Built step-1 pairs (in-memory): {len(pairs)}")
 
-    # Step-2 theme coupling in memory
+    # Step-2 theme coupling in memory (GLOBAL clustering)
     chunk_to_concepts = pairpackets._build_chunk_to_concepts(mentions_path)
-    concept_chunk_to_cluster, concept_cluster_label = pairpackets._load_cluster_index(clusters_with_assignments_path)
+
+    # ✅ UPDATED: _load_cluster_index now returns 3 values
+    chunk_to_cluster, cluster_label, cluster_top_chunks = pairpackets._load_cluster_index(
+        clusters_with_assignments_path,
+        top_k_chunks_per_cluster=2,
+    )
 
     total = len(pairs)
     for i, rec in enumerate(pairs, 1):
-        A, B = rec["pair"][0], rec["pair"][1]
+        A, B = str(rec["pair"][0]), str(rec["pair"][1])
 
+        # ✅ UPDATED: pass cluster_top_chunks (display-only)
         theme = pairpackets._compute_theme_coupling(
             A,
             B,
             chunk_to_concepts=chunk_to_concepts,
-            concept_chunk_to_cluster=concept_chunk_to_cluster,
-            concept_cluster_label=concept_cluster_label,
+            chunk_to_cluster=chunk_to_cluster,
+            cluster_label=cluster_label,
+            cluster_top_chunks=cluster_top_chunks,
         )
         rec["theme_coupling"] = theme
 
@@ -281,11 +315,11 @@ def run_pairpackets_final(
         ts = float(theme.get("cluster_conditional_coupling", {}).get("theme_support", 0.0))
         cf["theme_support"] = ts
 
-        # Match your example: theme_support should not live inside the theme block
+        # Keep theme_support only in confidence_features (not inside theme block)
         if isinstance(theme.get("cluster_conditional_coupling"), dict):
             theme["cluster_conditional_coupling"].pop("theme_support", None)
 
-        # Add lecture_indices (per your spec)
+        # Add lecture_indices
         rec.setdefault("co_occurrence", {})
         rec["co_occurrence"]["lecture_indices"] = _lecture_indices_for_pair(A, B, mentions=mentions)
 
@@ -297,19 +331,73 @@ def run_pairpackets_final(
     print(f"✅ Wrote FINAL pairpackets: {pairpackets_out} (pairs={len(pairs)})")
 
 
+# ----------------------------
+# NEW: Relation Judger wrapper
+# ----------------------------
+
+async def run_relation_judger(
+    *,
+    pairpackets_path: str,
+    relations_out: str,
+    model: Optional[str],
+    batch_size: Optional[int],
+    concurrency: Optional[int],
+) -> None:
+    """
+    Run relation judgment on pairpackets.
+    """
+    import os
+    from relation_judger import judge_pairpackets_file
+    
+    # Use provided args or fall back to env
+    model_name = model or os.getenv("RELATION_MODEL") or os.getenv("LLM_MODEL") or "meta-llama/Llama-3.2-3B-Instruct"
+    bs = batch_size or int(os.getenv("RELATION_BATCH_SIZE", "8"))
+    conc = concurrency or int(os.getenv("RELATION_CONCURRENCY", "5"))
+    
+    print(f"\n[relation_judger] Starting relation judgment...")
+    print(f"[relation_judger] Model={model_name} BatchSize={bs} Concurrency={conc}")
+    
+    await judge_pairpackets_file(
+        in_path=pairpackets_path,
+        out_path=relations_out,
+        model=model_name,
+        batch_size=bs,
+        concurrency=conc,
+    )
+
+
+def filter_mentions_by_min_unique_chunks(
+    mentions: List[Dict[str, Any]],
+    *,
+    min_unique_chunks: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Keep only concepts that appear in >= min_unique_chunks DISTINCT chunks.
+    Uniqueness is based on chunk_id (not number of mention rows).
+    """
+    concept_to_chunks: Dict[str, Set[str]] = defaultdict(set)
+    for m in mentions:
+        c = m.get("concept_id")
+        ch = m.get("chunk_id")
+        if c and ch:
+            concept_to_chunks[str(c)].add(str(ch))
+
+    allowed = {c for c, chunks in concept_to_chunks.items() if len(chunks) >= min_unique_chunks}
+
+    filtered = [m for m in mentions if str(m.get("concept_id")) in allowed]
+
+    print(
+        f"[filter] concepts kept={len(allowed)}/{len(concept_to_chunks)} "
+        f"(min_unique_chunks={min_unique_chunks}); "
+        f"mentions kept={len(filtered)}/{len(mentions)}"
+    )
+    return filtered
+
+
+
 def list_pdfs_in_sequence(data_dir: Path) -> List[str]:
     """
     Return PDFs sorted by an inferred sequence number (if present), otherwise by filename.
-
-    Examples it handles:
-      - ALecture10_Prompting.pdf  -> 10
-      - Lecture 2 - Intro.pdf     -> 2
-      - lec03.pdf                 -> 3
-      - ch.1_basics.pdf           -> 1
-      - week_12.pdf               -> 12
-
-    Sort key = (has_seq? 0 else 1, seq_number, normalized_name)
-    So anything with a detected sequence comes first, in numeric order.
     """
     import re
 
@@ -354,7 +442,6 @@ def main() -> None:
     p.add_argument("--out-dir", default=OUT_DIR)
 
     # control
-    # ✅ DEFAULT = None => OPEN / NO LIMIT
     p.add_argument(
         "--max-pairs",
         type=int,
@@ -367,10 +454,14 @@ def main() -> None:
 
     # LLM
     p.add_argument("--llm-model", default=OPENAI_CONCEPTS_MODEL)
+    
+    # NEW: Unified batching/concurrency for LLM and relations
+    p.add_argument("--batch-size", type=int, default=8, help="Batch size for LLM chunks AND relation pairs")
+    p.add_argument("--concurrency", type=int, default=5, help="Concurrency for relation judger")
 
-    # clustering
+    # clustering (separate batch-size for embeddings)
     p.add_argument("--embedding-model", default="all-MiniLM-L6-v2")
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--embedding-batch-size", type=int, default=32, help="Batch size for embeddings (clustering)")
     p.add_argument("--umap-components", type=int, default=5)
     p.add_argument("--min-contexts-to-cluster", type=int, default=3)
     p.add_argument("--min-cluster-size", type=int, default=2)
@@ -381,8 +472,8 @@ def main() -> None:
     p.add_argument(
         "--steps",
         nargs="+",
-        default=["ingest", "llm", "clustering", "pairpackets"],
-        help="Any subset of: ingest llm clustering pairpackets",
+        default=["ingest", "llm", "clustering", "pairpackets", "relations"],
+        help="Any subset of: ingest llm clustering pairpackets relations",
     )
 
     args = p.parse_args()
@@ -395,6 +486,7 @@ def main() -> None:
     concept_cards_path = str(out_dir / "concept_cards.jsonl")
     clusters_path = str(out_dir / "context_clusters.with_assignments.jsonl")
     pairpackets_path = str(out_dir / "pairpackets.jsonl")
+    relations_path = str(out_dir / "relations.jsonl")  # NEW
 
     # ✅ treat 0/-1 as "no limit" too
     if args.max_pairs is not None and args.max_pairs <= 0:
@@ -406,7 +498,7 @@ def main() -> None:
         pdfs = list_pdfs_in_sequence(data_dir)
         if not pdfs:
             raise SystemExit(f"❌ No PDFs found in ./{args.data_dir}")
-        ingest.ingest_pdfs(pdfs, out_name="chunks.jsonl")
+        ingest.ingest_pdfs(pdfs, out_name="chunks.jsonl", out_dir=str(out_dir))
 
 
     # Step 2: LLM => mentions + concept cards
@@ -417,17 +509,21 @@ def main() -> None:
                 mentions_out=mentions_path,
                 concept_cards_out=concept_cards_path,
                 model=args.llm_model,
+                batch_size=args.batch_size,  # ✅ Use unified batch_size
             )
         )
+        mentions = read_jsonl(mentions_path)
+        mentions = filter_mentions_by_min_unique_chunks(mentions, min_unique_chunks=3)
+        write_jsonl(mentions_path, mentions)
 
-    # Step 3: clustering => context clusters + assignments
+    # Step 3: clustering
     if "clustering" in args.steps:
         run_clustering(
             chunks_path=chunks_path,
             mentions_path=mentions_path,
             clusters_out=clusters_path,
             embedding_model=args.embedding_model,
-            batch_size=args.batch_size,
+            embedding_batch_size=args.embedding_batch_size,  # ✅ Use separate embedding batch size
             umap_components=args.umap_components,
             min_contexts_to_cluster=args.min_contexts_to_cluster,
             min_cluster_size=args.min_cluster_size,
@@ -436,16 +532,28 @@ def main() -> None:
             progress_every=args.progress_every,
         )
 
-    # Step 4: pairpackets => FINAL one-file output
+    # Step 4: pairpackets
     if "pairpackets" in args.steps:
         run_pairpackets_final(
             mentions_path=mentions_path,
             clusters_with_assignments_path=clusters_path,
             pairpackets_out=pairpackets_path,
-            max_pairs=args.max_pairs,  # ✅ None = unlimited
+            max_pairs=args.max_pairs,
             min_cooc_chunks=args.min_cooc_chunks,
             max_role_evidence_per_side=args.max_role_evidence_per_side,
             progress_every=args.progress_every,
+        )
+
+    # Step 5: relations
+    if "relations" in args.steps:
+        asyncio.run(
+            run_relation_judger(
+                pairpackets_path=pairpackets_path,
+                relations_out=relations_path,
+                model=args.llm_model,  # ✅ Use same model
+                batch_size=args.batch_size,  # ✅ Use unified batch_size
+                concurrency=args.concurrency,  # ✅ Use unified concurrency
+            )
         )
 
     print("\n=== Outputs ===")
@@ -453,7 +561,8 @@ def main() -> None:
     print("mentions:     ", mentions_path)
     print("concept_cards:", concept_cards_path)
     print("clusters:     ", clusters_path)
-    print("FINAL:        ", pairpackets_path)
+    print("pairpackets:  ", pairpackets_path)
+    print("relations:    ", relations_path)  # NEW
 
 
 

@@ -11,21 +11,48 @@ class ChunkClassification(BaseModel):
 
 class RoleTaggerOutput(BaseModel):
     "Role for concept in a chunk + a short evidence snippet."
-    role: Literal["Example", "Definition", "Assumption"]
+    role: Literal["Example", "Definition", "Assumption", "NA"]
     snippet: str
 
 ROLE_CLASSIFICATION_PROMPT = """
-You will be given a text chunk and a concept from a university course lecture.
-Classify the relevance of the concept to the chunk into one of three categories: Example, Definition, or Assumption.
+You will be given a text chunk from university lecture notes or slides and a concept from the course.
+Classify the role the concept plays in this chunk into one of four categories:
 
-Also return an evidence snippet copied from the chunk (10–30 words) that best supports your relevance label.
-- The snippet MUST be an exact substring from the chunk.
-- Keep it short.
+1**Definition**: The concept is being defined, explained, or introduced. The text describes what the concept is, its properties, or how it works.
+Simple example: "Binary search is an algorithm that finds an element in a sorted array by repeatedly dividing the search interval in half."
+Complex example: 
+- Concept: "Big O notation"
+- Text: "When analyzing algorithm efficiency, we need a formal way to describe performance. Big O notation provides an upper bound on the growth rate of an algorithm's time complexity, expressing how runtime scales with input size n."
+- Classification: Definition (the concept itself is being explained, even when embedded in broader context)
 
-Return strict JSON:
-{ "role": "Example" | "Definition" | "Assumption", "snippet": "..." }
+2**Example**: The concept is being demonstrated or illustrated through a concrete example, walkthrough, or application. The text shows the concept in action.
+Simple example: "Let's apply binary search to find 7 in [1,3,5,7,9,11]: First, check the middle element 5..."
+Complex example:
+- Concept: "Recursion"
+- Text: "To understand how the call stack works, consider computing factorial(3). The function calls factorial(2), which calls factorial(1), which calls factorial(0) returning 1. Then factorial(1) returns 1×1=1, factorial(2) returns 2×1=2, and finally factorial(3) returns 3×2=6."
+- Classification: Example (shows recursion through a concrete walkthrough, even if framed as explanation)
+
+3**Assumption**: The concept is being used as prior knowledge, a prerequisite, or a foundation for explaining something else. The text assumes familiarity with the concept to build further understanding.
+Simple example: "Using binary search, we can now efficiently implement the dictionary lookup feature..."
+Complex example:
+- Concept: "Hash functions"
+- Text: "Hash tables achieve O(1) average-case lookup because hash functions distribute keys uniformly across buckets. However, we must handle collisions when multiple keys map to the same index."
+- Classification: Assumption (hash functions are used as known background to explain hash table behavior)
+
+4** NA **: The concept does not fall under any of the above mentioned roles: (Definition, Example, Assumption).
+
+
+**Key distinction**: If the concept is being taught → Definition. If it's being shown in action → Example. If it's being used to explain something else → Assumption. If none of the previously mentioned then -> NA
+
+
+Also return an evidence snippet:
+- Must be an exact substring copied from the chunk (10–30 words)
+- Should best support your classification
+- Keep it concise and relevant
+
+Return strict JSON format only:
+{ "role": "Definition" | "Example" | "Assumption" | "NA", "snippet": "..." }
 """.strip()
-
 
 CHUNK_CLASSIFICATION_PROMPT = """
 You are an academic course content classifier.

@@ -113,17 +113,132 @@ async def classify_concept_role_llm(
 
         out = parse_pydantic_from_llm_text(resp.output_text, RoleTaggerOutput)
         if not out:
-            return None
-
+            # ✅ Instead of returning None, return NA with empty snippet
+            logger.warning(f"Failed to parse role for concept='{concept}', defaulting to NA")
+            return {"role": "na", "snippet": ""}
 
         # keep your downstream keys: role + snippet
         return {"role": out.role, "snippet": out.snippet.strip()}
 
-
     except Exception as e:
         logger.warning(f"Role classification failed for concept='{concept}': {e}")
-        return None
+        # ✅ Return NA instead of None
+        return {"role": "na", "snippet": ""}
 
+# --- Batching helpers (HF speedup) ---
+
+def _is_hf_provider() -> bool:
+    p = (os.getenv("LLM_PROVIDER", "openai") or "").lower().strip()
+    return p in ("hf", "huggingface", "local")
+
+
+def _resp_texts(resp: Any) -> List[str]:
+    # HF batched responses return output_texts; others typically return output_text
+    xs = getattr(resp, "output_texts", None)
+    if isinstance(xs, list) and xs:
+        return [str(x) for x in xs]
+    ot = getattr(resp, "output_text", "")
+    return [str(ot)]
+
+
+async def extract_concepts_llm_batch(client: Any, texts: List[str], model: str) -> List[List[str]]:
+    """
+    Returns concepts per text, aligned with input order.
+    Uses 1 batched call on HF; falls back to per-item calls otherwise.
+    """
+    if not texts:
+        return []
+
+    if not _is_hf_provider() or len(texts) == 1:
+        return [await extract_concepts_llm(client, text=t, model=model) for t in texts]
+
+    resp = await client.responses.create(
+        model=model,
+        instructions=CONCEPT_EXTRACTION_PROMPT
+        + "\n\nReturn ONLY the strict JSON object and nothing else.",
+        input=[
+            [{"role": "user", "content": [{"type": "input_text", "text": t}]}]
+            for t in texts
+        ],
+    )
+    outs = _resp_texts(resp)
+
+    results: List[List[str]] = []
+    for raw in outs:
+        out = parse_pydantic_from_llm_text(raw, ConceptExtractionOutput)
+        if not out or not isinstance(out.concepts, list):
+            results.append([])
+            continue
+
+        seen = set()
+        concepts: List[str] = []
+        for c in out.concepts:
+            if not isinstance(c, str):
+                continue
+            cc = c.strip()
+            if not cc:
+                continue
+            key = cc.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            concepts.append(cc)
+        results.append(concepts)
+
+    # Safety: keep alignment
+    if len(results) != len(texts):
+        results = (results + [[]] * len(texts))[: len(texts)]
+    return results
+
+
+async def classify_concept_role_llm_batch_texts(client: Any, user_texts: List[str], model: str) -> List[Dict[str, str]]:
+    """
+    user_texts items should be like: f"CHUNK:\\n{chunk}\\n\\nCONCEPT:\\n{concept}"
+    Returns list of {"role": "...", "snippet": "..."} aligned with user_texts.
+    Uses 1 batched call on HF; falls back otherwise.
+    """
+    if not user_texts:
+        return []
+
+    if not _is_hf_provider() or len(user_texts) == 1:
+        # fallback: per-item create call (keeps behavior for OpenAI/Anthropic)
+        out_tags: List[Dict[str, str]] = []
+        for ut in user_texts:
+            resp = await client.responses.create(
+                model=model,
+                instructions=ROLE_CLASSIFICATION_PROMPT
+                + "\n\nReturn ONLY the strict JSON object and nothing else.",
+                input=[[{"role": "user", "content": [{"type": "input_text", "text": ut}]}]],
+            )
+            parsed = parse_pydantic_from_llm_text(resp.output_text, RoleTaggerOutput)
+            if not parsed:
+                out_tags.append({"role": "na", "snippet": ""})
+            else:
+                out_tags.append({"role": parsed.role, "snippet": (parsed.snippet or "").strip()})
+        return out_tags
+
+    resp = await client.responses.create(
+        model=model,
+        instructions=ROLE_CLASSIFICATION_PROMPT
+        + "\n\nReturn ONLY the strict JSON object and nothing else.",
+        input=[
+            [{"role": "user", "content": [{"type": "input_text", "text": ut}]}]
+            for ut in user_texts
+        ],
+    )
+    outs = _resp_texts(resp)
+
+    tags: List[Dict[str, str]] = []
+    for raw in outs:
+        out = parse_pydantic_from_llm_text(raw, RoleTaggerOutput)
+        if not out:
+            tags.append({"role": "na", "snippet": ""})
+        else:
+            tags.append({"role": out.role, "snippet": (out.snippet or "").strip()})
+
+    if len(tags) != len(user_texts):
+        tags = (tags + [{"role": "na", "snippet": ""}] * len(user_texts))[: len(user_texts)]
+    return tags
 
 # ----------------------------
 # Main pipeline (what you asked for)
@@ -152,7 +267,7 @@ async def extract_concepts_with_roles_from_chunks(
       "chunk_id": "...",
       "chunk_index": ...,
       "page_numbers": [...],
-      "role": "example" | "definition" | "assumption",
+      "role": "example" | "definition" | "assumption" | "none",
       "snippet": "..."
     }
     """
@@ -190,7 +305,7 @@ async def extract_concepts_with_roles_from_chunks(
                     "chunk_index": ch.get("chunk_index", idx),
                     "page_numbers": ch.get("page_numbers") or [],
                     "role": tag["role"].lower(),
-                    "snippet": tag["snippet"],
+                    "snippet": ch.get("text"),
                 }
             )
 
@@ -265,6 +380,7 @@ def build_concept_cards(
             "definition": "defined",
             "example": "example",
             "assumption": "assumed",
+            "na": "na",
         }
 
         buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -273,7 +389,7 @@ def build_concept_cards(
             buckets[bucket].append(m)
 
         usage_signals: Dict[str, Any] = {}
-        for bucket_name in ["defined", "example", "assumed"]:
+        for bucket_name in ["defined", "example", "assumed", "na"]:
             ev = buckets.get(bucket_name, [])
             usage_signals[bucket_name] = {
                 "count": len(ev),
@@ -283,6 +399,7 @@ def build_concept_cards(
                         "chunk_id": e["chunk_id"],
                         "page_numbers": e.get("page_numbers") or [],
                         "snippet": e["snippet"],
+                        "chunk_text": e.get("chunk_text", ""),
                     }
                     for e in ev[:evidence_per_role]
                 ],

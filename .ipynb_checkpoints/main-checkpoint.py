@@ -116,6 +116,7 @@ async def run_llm_and_cards(
                     "page_numbers": ch.get("page_numbers") or [],
                     "role": (tag.get("role") or "").lower(),
                     "snippet": (tag.get("snippet") or "").strip(),
+                    "chunk_text": text,
                 }
             )
         added = len(mentions) - before

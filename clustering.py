@@ -7,15 +7,23 @@ Reads:
   - out/mentions.jsonl (from llm.py: concept_id + chunk_id, etc.)
 
 Writes:
-  - out/context_clusters.jsonl (one record per concept_id) with ONLY:
+  - out/context_clusters.jsonl (one record per concept_id) like:
 
     {
       "concept_id": "LEFT_OUTER_JOIN",
       "context_clusters": [
-        { "cluster_id": 4, "count_chunks": 6, "label_hint": "joins-and-null-semantics" },
-        { "cluster_id": 1, "count_chunks": 3, "label_hint": "query-examples" }
+        {
+          "cluster_id": 4,
+          "count_chunks": 6,
+          "label_hint": "joins-and-null-semantics",
+          "chunks": [
+            { "chunk_id": "lec3__0012", "text": "..." },
+            { "chunk_id": "lec3__0044", "text": "..." }
+          ]
+        }
       ]
     }
+
 
 Notes:
 - We deduplicate contexts by (concept_id, chunk_id) so each chunk counts once per concept.
@@ -389,16 +397,55 @@ def cluster_concept(
     top_terms: int,
 ) -> Dict[str, Any]:
     """
-    Same output schema, but safer:
-    - only falls back to cluster 0 when there are truly too few contexts OR clustering disabled.
-    - uses PCA (as you already do) and then HDBSCAN.
+    Output (minimal + useful):
+      {
+        "concept_id": ...,
+        "context_clusters": [
+          {
+            "cluster_id": int,
+            "label_hint": str,
+            "count_chunks": int,
+            "chunks": [{"chunk_id": str, "text": str}, ...]
+          },
+          ...
+        ]
+      }
+
+    Notes:
+    - We drop chunk_cluster_assignments (redundant once chunks are stored per cluster).
+    - We keep noise chunks (cluster_id = -1) as a cluster labeled "noise" so nothing is lost.
     """
     n = len(texts)
     if len(chunk_ids) != n:
         raise ValueError(f"[{concept_id}] chunk_ids and texts length mismatch: {len(chunk_ids)} != {n}")
 
+    def _cluster_chunk_items(indices: List[int]) -> List[Dict[str, Any]]:
+        items = [{"chunk_id": chunk_ids[i], "text": texts[i]} for i in indices]
+        items.sort(key=lambda x: x["chunk_id"])  # stable ordering
+        return items
+
+    def _one_cluster_label_from_texts() -> Dict[str, Any]:
+        # Use c-TF-IDF on the single combined "cluster" to get a non-misc label
+        try:
+            terms = ctfidf_terms_per_cluster([" ".join(texts)], top_terms=top_terms)[0]
+            hint = terms_to_label_hint(terms) if terms else "misc"
+        except Exception:
+            hint = "misc"
+
+        return {
+            "concept_id": concept_id,
+            "context_clusters": [
+                {
+                    "cluster_id": 0,
+                    "label_hint": hint,
+                    "count_chunks": n,
+                    "chunks": _cluster_chunk_items(list(range(n))),
+                }
+            ],
+        }
+
     if n == 0:
-        return {"concept_id": concept_id, "context_clusters": [], "chunk_cluster_assignments": []}
+        return {"concept_id": concept_id, "context_clusters": []}
 
     # IMPORTANT: in your codebase, 'use_umap' is effectively "enable clustering"
     enable_clustering = bool(use_umap)
@@ -413,11 +460,7 @@ def cluster_concept(
 
     # Fallback: too few contexts OR clustering disabled
     if (n < int(min_contexts_to_cluster)) or (not enable_clustering):
-        return {
-            "concept_id": concept_id,
-            "context_clusters": [{"cluster_id": 0, "count_chunks": n, "label_hint": "misc"}],
-            "chunk_cluster_assignments": [{"chunk_id": cid, "cluster_id": 0} for cid in chunk_ids],
-        }
+        return _one_cluster_label_from_texts()
 
     # PCA reduction
     n_components = max(2, min(int(umap_components), n, X.shape[1]))
@@ -427,7 +470,6 @@ def cluster_concept(
     if min_cluster_size is not None:
         mcs = int(min_cluster_size)
     else:
-        # sensible default for small per-concept context counts
         mcs = max(2, min(8, n // 3 if n >= 6 else 2))
 
     labels = cluster_hdbscan(Xr, min_cluster_size=mcs, min_samples=min_samples)
@@ -437,34 +479,245 @@ def cluster_concept(
     for i, lab in enumerate(labels):
         by_label[int(lab)].append(i)
 
-    # if all noise => treat as one cluster
+    # If all noise => treat as one cluster (but label it from text)
     non_noise = sorted([lab for lab in by_label.keys() if lab != -1])
     if not non_noise:
-        return {
-            "concept_id": concept_id,
-            "context_clusters": [{"cluster_id": 0, "count_chunks": n, "label_hint": "misc"}],
-            "chunk_cluster_assignments": [{"chunk_id": cid, "cluster_id": 0} for cid in chunk_ids],
-        }
+        return _one_cluster_label_from_texts()
 
-    # label hints using c-TF-IDF
+    # label hints using c-TF-IDF for non-noise clusters only
     cluster_docs = [" ".join(texts[i] for i in by_label[lab]) for lab in non_noise]
     term_lists = ctfidf_terms_per_cluster(cluster_docs, top_terms=top_terms)
+    terms_by_label = {lab: terms for lab, terms in zip(non_noise, term_lists)}
 
     context_clusters: List[Dict[str, Any]] = []
-    for lab, terms in zip(non_noise, term_lists):
+
+    # Build cluster records for ALL labels (including noise = -1)
+    for lab, idxs in by_label.items():
+        if lab == -1:
+            label_hint = "noise"
+        else:
+            label_hint = terms_to_label_hint(terms_by_label.get(lab, []))
+
         context_clusters.append(
             {
                 "cluster_id": int(lab),
-                "count_chunks": len(by_label[lab]),
-                "label_hint": terms_to_label_hint(terms),
+                "label_hint": label_hint,
+                "count_chunks": len(idxs),
+                "chunks": _cluster_chunk_items(idxs),
             }
         )
-    context_clusters.sort(key=lambda x: -x["count_chunks"])
 
-    chunk_cluster_assignments = [{"chunk_id": chunk_ids[i], "cluster_id": int(labels[i])} for i in range(n)]
+    # Sort: bigger clusters first; put noise last
+    context_clusters.sort(
+        key=lambda x: (
+            1 if x["cluster_id"] == -1 else 0,  # noise last
+            -x["count_chunks"],                  # bigger first
+            x["cluster_id"],                     # stable tiebreak
+        )
+    )
 
     return {
         "concept_id": concept_id,
         "context_clusters": context_clusters,
-        "chunk_cluster_assignments": chunk_cluster_assignments,
     }
+
+def cluster_global_chunks(
+    *,
+    chunks: List[Dict[str, Any]],
+    mentions: List[Dict[str, Any]],
+    embedding_model: str,
+    batch_size: int,
+    normalize_embeddings: bool,
+    use_umap: bool,
+    umap_neighbors: int,
+    umap_components: int,
+    min_cluster_size: Optional[int],
+    min_samples: Optional[int],
+    top_terms: int,
+    top_k_concept_role: int = 3,
+    top_k_chunks_per_cluster: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Global clustering across ALL chunks.
+
+    Output records (one per global cluster):
+    {
+      "cluster_id": 7,
+      "label_hint": "...",
+      "count_chunks": 42,
+      "concept_role_tuples": [
+        {"concept":"Gradient Descent","role":"definition","count":12},
+        ...
+      ],
+      "chunks":[{"chunk_id":"...","text":"..."}]  # top 2 representative chunks, FULL text
+    }
+    """
+
+    # ---- helpers ----
+    def _get_text(ch: Dict[str, Any]) -> str:
+        for k in ("text", "chunk_text", "content", "raw_text", "page_text", "body", "markdown"):
+            v = ch.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for k in ("lines", "sentences", "paragraphs"):
+            v = ch.get(k)
+            if isinstance(v, list):
+                s = "\n".join(str(x) for x in v if str(x).strip()).strip()
+                if s:
+                    return s
+        return ""
+
+    def _build_chunk_to_concept_role_counts(
+        mentions_: List[Dict[str, Any]]
+    ) -> Dict[str, Dict[Tuple[str, str], int]]:
+        # chunk_id -> {(concept_label, role): count}
+        out: Dict[str, Dict[Tuple[str, str], int]] = defaultdict(lambda: defaultdict(int))
+        for m in mentions_:
+            cid = m.get("chunk_id")
+            if not cid:
+                continue
+            concept = (m.get("concept") or m.get("concept_id") or "").strip()
+            role = (m.get("role") or "").strip().lower()
+            if not concept or not role:
+                continue
+            out[str(cid)][(concept, role)] += 1
+        return out
+
+    def _top_concept_role_for_cluster(
+        chunk_ids: List[str],
+        chunk_to_counts: Dict[str, Dict[Tuple[str, str], int]],
+        k: int,
+    ) -> List[Dict[str, Any]]:
+        agg: Dict[Tuple[str, str], int] = defaultdict(int)
+        for cid in chunk_ids:
+            for (concept, role), ct in chunk_to_counts.get(cid, {}).items():
+                agg[(concept, role)] += int(ct)
+
+        top = sorted(agg.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))[:k]
+        return [{"concept": c, "role": r, "count": n} for (c, r), n in top]
+
+    # ---- collect all valid chunk texts ----
+    chunk_ids: List[str] = []
+    texts: List[str] = []
+    for ch in chunks:
+        cid = ch.get("chunk_id")
+        if cid is None:
+            continue
+        cid = str(cid).strip()
+        if not cid:
+            continue
+        t = _get_text(ch)
+        if not t:
+            continue
+        chunk_ids.append(cid)
+        texts.append(t)
+
+    if not texts:
+        return []
+
+    # ---- embed ----
+    X = embed_texts(
+        texts,
+        model_name=embedding_model,
+        batch_size=batch_size,
+        normalize_embeddings=normalize_embeddings,
+    )
+
+    enable_clustering = bool(use_umap)
+
+    # If clustering disabled, return one big cluster (id=0)
+    if not enable_clustering:
+        try:
+            terms = ctfidf_terms_per_cluster([" ".join(texts)], top_terms=top_terms)[0]
+            hint = terms_to_label_hint(terms) if terms else "misc"
+        except Exception:
+            hint = "misc"
+
+        chunk_to_counts = _build_chunk_to_concept_role_counts(mentions)
+        top_tuples = _top_concept_role_for_cluster(chunk_ids, chunk_to_counts, top_k_concept_role)
+        top_chunks = [{"chunk_id": chunk_ids[i], "text": texts[i]} for i in range(min(top_k_chunks_per_cluster, len(texts)))]
+
+        return [
+    {
+        "cluster_id": 0,
+        "label_hint": hint,
+        "count_chunks": len(chunk_ids),
+        "chunk_ids": chunk_ids,            # ✅ NEW: all member chunk ids
+        "concept_role_tuples": top_tuples, # ✅ rename to be consistent
+        "chunks": top_chunks,              # top-2 preview texts
+    }
+]
+
+
+    # ---- reduce + cluster ----
+    n = len(texts)
+    n_components = max(2, min(int(umap_components), n, X.shape[1]))
+    Xr = PCA(n_components=n_components, random_state=42).fit_transform(X)
+
+    if min_cluster_size is not None:
+        mcs = int(min_cluster_size)
+    else:
+        # sensible default for global clustering
+        mcs = max(5, min(25, n // 50 if n >= 500 else max(5, n // 20)))
+
+    labels = cluster_hdbscan(Xr, min_cluster_size=mcs, min_samples=min_samples)
+
+    by_label: Dict[int, List[int]] = defaultdict(list)
+    for i, lab in enumerate(labels):
+        by_label[int(lab)].append(i)
+
+    non_noise = sorted([lab for lab in by_label.keys() if lab != -1])
+    cluster_docs = [" ".join(texts[i] for i in by_label[lab]) for lab in non_noise]
+    term_lists = ctfidf_terms_per_cluster(cluster_docs, top_terms=top_terms) if non_noise else []
+    terms_by_label = {lab: terms for lab, terms in zip(non_noise, term_lists)}
+
+    # Precompute per-chunk embedding norms for representative selection
+    # Representative chunks = closest to cluster centroid (cosine, since we normalize embeddings typically)
+    SentenceTransformer, np, *_ = _import_or_die()
+    Xnp = np.asarray(X, dtype="float32")
+
+    chunk_to_counts = _build_chunk_to_concept_role_counts(mentions)
+
+    out: List[Dict[str, Any]] = []
+    for lab, idxs in by_label.items():
+        if not idxs:
+            continue
+
+        # label hint
+        if lab == -1:
+            label_hint = "noise"
+        else:
+            label_hint = terms_to_label_hint(terms_by_label.get(lab, []))
+
+        # representative chunks: nearest to centroid
+        Xc = Xnp[idxs]
+        centroid = Xc.mean(axis=0, keepdims=True)
+        # cosine similarity ~ dot when normalized; still works reasonably even if not perfectly normalized
+        sims = (Xc @ centroid.T).reshape(-1)
+        order = sims.argsort()[::-1]  # best first
+        chosen = [idxs[int(j)] for j in order[:top_k_chunks_per_cluster]]
+
+        cluster_chunk_ids = [chunk_ids[i] for i in idxs]
+        top_tuples = _top_concept_role_for_cluster(cluster_chunk_ids, chunk_to_counts, top_k_concept_role)
+
+        out.append(
+    {
+        "cluster_id": int(lab),
+        "label_hint": label_hint,
+        "count_chunks": len(idxs),
+        "chunk_ids": cluster_chunk_ids,     # ✅ NEW: all member chunk ids
+        "concept_role_tuples": top_tuples,
+        "chunks": [{"chunk_id": chunk_ids[i], "text": texts[i]} for i in chosen],  # still top-2
+    }
+)
+
+
+    # sort: bigger first, noise last
+    out.sort(
+        key=lambda r: (
+            1 if r["cluster_id"] == -1 else 0,
+            -r["count_chunks"],
+            r["cluster_id"],
+        )
+    )
+    return out

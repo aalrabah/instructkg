@@ -89,7 +89,7 @@ def _role_evidence_chunks(
     for m in mentions:
         concept_id = m.get("concept_id")
         role = (m.get("role") or "").lower()
-        if not concept_id or role not in ("definition", "example", "assumption"):
+        if not concept_id or role not in ("definition", "example", "assumption", "na"):
             continue
 
         rec = {
@@ -137,7 +137,12 @@ def build_pairpackets(
     - role-grounded coupling (definition/example chunks mention other concept in same chunk)
     - chunk co-occurrence + negative evidence
     - confidence features (no theme yet => theme_support = 0.0)
+
+    NEW (display only):
+    - co_occurrence.top_chunks: top 2 co-occur chunk previews (prefers role-grounded chunks)
     """
+    TOP_K_COOC_CHUNKS = 2  # display-only
+
     lecture_order = _lecture_order_from_mentions(mentions)
     first_intro = _first_intro(mentions, lecture_order)
 
@@ -146,6 +151,33 @@ def build_pairpackets(
     cooc = _cooc_counts(chunk_concepts)
 
     role_evidence = _role_evidence_chunks(mentions, max_per_role=max_role_evidence_per_side)
+
+    # Build chunk_id -> {text, page_numbers} for display
+    chunk_text_map: Dict[str, Dict[str, Any]] = {}
+
+    # Prefer chunks passed in (if provided)
+    if chunks:
+        for ch in chunks:
+            cid = ch.get("chunk_id")
+            if not cid:
+                continue
+            chunk_text_map[str(cid)] = {
+                "text": (ch.get("text") or ""),
+                "page_numbers": ch.get("page_numbers") or [],
+            }
+    else:
+        # Fallback: use mentions (your mentions include chunk_text)
+        for m in mentions:
+            cid = m.get("chunk_id")
+            if not cid:
+                continue
+            cid = str(cid)
+            if cid in chunk_text_map:
+                continue
+            chunk_text_map[cid] = {
+                "text": (m.get("chunk_text") or ""),
+                "page_numbers": m.get("page_numbers") or [],
+            }
 
     # Candidate pairs: any (A,B) with cooc >= min_cooc_chunks
     candidates = [(a, b, c) for (a, b), c in cooc.items() if a != b and c >= min_cooc_chunks]
@@ -166,7 +198,6 @@ def build_pairpackets(
         A_first = first_intro.get(A)
         B_first = first_intro.get(B)
         if not A_first or not B_first:
-            # if a concept somehow lacks intro, skip (should be rare)
             continue
 
         gap = int(A_first["lecture_index"]) - int(B_first["lecture_index"])
@@ -223,6 +254,42 @@ def build_pairpackets(
         a_without_b = len(A_chunks - B_chunks)
         b_without_a = len(B_chunks - A_chunks)
 
+        # NEW: top co-occur chunk previews (prefer role-grounded evidence chunks)
+        co_chunks_sorted = sorted(list(A_chunks & B_chunks))
+
+        evidence_chunk_ids_in_order: List[str] = []
+        seen_ev: Set[str] = set()
+        for ev in (A_defined_mentions_B_support + A_example_mentions_B_support + B_defined_mentions_A_support):
+            cid = str(ev.get("chunk_id") or "")
+            if cid and cid not in seen_ev:
+                seen_ev.add(cid)
+                evidence_chunk_ids_in_order.append(cid)
+
+        # build final ranked list: evidence chunks first, then the rest
+        ranked_chunk_ids: List[str] = []
+        ranked_seen: Set[str] = set()
+
+        for cid in evidence_chunk_ids_in_order:
+            if cid in co_chunks_sorted and cid not in ranked_seen:
+                ranked_seen.add(cid)
+                ranked_chunk_ids.append(cid)
+
+        for cid in co_chunks_sorted:
+            if cid not in ranked_seen:
+                ranked_seen.add(cid)
+                ranked_chunk_ids.append(cid)
+
+        top_chunks: List[Dict[str, Any]] = []
+        for cid in ranked_chunk_ids[:TOP_K_COOC_CHUNKS]:
+            meta = chunk_text_map.get(cid, {})
+            top_chunks.append(
+                {
+                    "chunk_id": cid,
+                    "page_numbers": meta.get("page_numbers") or [],
+                    "text": meta.get("text") or "",
+                }
+            )
+
         # Confidence features (deterministic)
         temporal_ok = 1 if int(B_first["lecture_index"]) < int(A_first["lecture_index"]) else 0
 
@@ -265,6 +332,7 @@ def build_pairpackets(
 
             "co_occurrence": {
                 "count_chunks_together": together,
+                "top_chunks": top_chunks,  # ✅ NEW (display only)
                 # lecture_indices can be added later if you want; keep Step-1 minimal
             },
 
@@ -290,7 +358,7 @@ def build_pairpackets(
 
     return out
 
-    # ---------------------------
+# ---------------------------
 # Step 2: Theme coupling (clustering-aware) enrichment
 # ---------------------------
 
@@ -339,14 +407,30 @@ def _build_chunk_to_concepts(mentions_path: str) -> Dict[str, Set[str]]:
 
 def _load_cluster_index(
     clusters_with_assignments_path: str,
-) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[int, str]]]:
+    *,
+    top_k_chunks_per_cluster: int = 2,
+) -> Tuple[Dict[str, int], Dict[int, str], Dict[int, List[Dict[str, Any]]]]:
     """
-    Reads out/context_clusters.with_assignments.jsonl and builds:
-      1) concept_chunk_to_cluster[concept_id][chunk_id] = cluster_id
-      2) concept_cluster_label[concept_id][cluster_id] = label_hint
+    Reads out/context_clusters.with_assignments.jsonl produced by clustering.cluster_global_chunks()
+
+    Expected line format (one global cluster per line), e.g.:
+      {
+        "cluster_id": 1,
+        "label_hint": "...",
+        "count_chunks": 6,
+        "chunk_ids": ["c1","c2",...],
+        "concept_role_tuples": [...],
+        "chunks": [{"chunk_id":"c1","text":"..."}, ...]   # top preview texts
+      }
+
+    Returns:
+      1) chunk_to_cluster[chunk_id] = cluster_id
+      2) cluster_label[cluster_id] = label_hint
+      3) cluster_top_chunks[cluster_id] = [{"chunk_id":..,"text":..}, ...] (TOP-K, display only)
     """
-    concept_chunk_to_cluster: Dict[str, Dict[str, int]] = defaultdict(dict)
-    concept_cluster_label: Dict[str, Dict[int, str]] = defaultdict(dict)
+    chunk_to_cluster: Dict[str, int] = {}
+    cluster_label: Dict[int, str] = {}
+    cluster_top_chunks: Dict[int, List[Dict[str, Any]]] = {}
 
     with open(clusters_with_assignments_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -354,33 +438,46 @@ def _load_cluster_index(
             if not line:
                 continue
             r = json.loads(line)
-            concept_id = str(r.get("concept_id", "")).strip()
-            if not concept_id:
+
+            try:
+                k = int(r.get("cluster_id"))
+            except Exception:
                 continue
 
-            # labels
-            for cc in (r.get("context_clusters") or []):
-                try:
-                    k = int(cc.get("cluster_id"))
-                except Exception:
-                    continue
-                concept_cluster_label[concept_id][k] = str(cc.get("label_hint", "misc"))
+            label = str(r.get("label_hint") or "misc")
+            cluster_label[k] = label
 
-            # assignments
-            for a in (r.get("chunk_cluster_assignments") or []):
-                ch = a.get("chunk_id")
+            # NEW: keep top preview chunk texts per cluster (display only)
+            previews: List[Dict[str, Any]] = []
+            for item in (r.get("chunks") or []):
+                ch_id = item.get("chunk_id")
+                txt = item.get("text")
+                if ch_id and isinstance(txt, str) and txt.strip():
+                    previews.append({"chunk_id": str(ch_id), "text": txt})
+                if len(previews) >= int(top_k_chunks_per_cluster):
+                    break
+            cluster_top_chunks[k] = previews
+
+            # Prefer chunk_ids (all members). Fallback to chunks[].chunk_id if needed.
+            members = r.get("chunk_ids")
+            if not isinstance(members, list) or not members:
+                members = []
+                for item in (r.get("chunks") or []):
+                    ch = item.get("chunk_id")
+                    if ch:
+                        members.append(ch)
+
+            for ch in members:
                 if not ch:
                     continue
-                try:
-                    k = int(a.get("cluster_id", 0))
-                except Exception:
-                    k = 0
-                concept_chunk_to_cluster[concept_id][str(ch)] = k
+                chunk_to_cluster[str(ch)] = k
 
-            # always safe defaults
-            concept_cluster_label[concept_id].setdefault(0, "misc")
+    # safe default
+    cluster_label.setdefault(0, "misc")
+    cluster_top_chunks.setdefault(0, [])
+    return chunk_to_cluster, cluster_label, cluster_top_chunks
 
-    return concept_chunk_to_cluster, concept_cluster_label
+
 
 
 def _compute_theme_coupling(
@@ -388,57 +485,69 @@ def _compute_theme_coupling(
     B: str,
     *,
     chunk_to_concepts: Dict[str, Set[str]],
-    concept_chunk_to_cluster: Dict[str, Dict[str, int]],
-    concept_cluster_label: Dict[str, Dict[int, str]],
+    chunk_to_cluster: Dict[str, int],
+    cluster_label: Dict[int, str],
+    cluster_top_chunks: Optional[Dict[int, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """
-    Theme coupling using SAME-CHUNK evidence:
-      - cluster_overlap: counts of (A_cluster_id, B_cluster_id) among chunks where both appear
-      - cluster_conditional_coupling: for each A_cluster_id, how often B is present when A appears in that cluster
+    Theme coupling using SAME-CHUNK evidence + GLOBAL clusters (display-only cluster_texts added).
+
+    For each chunk where A appears:
+      - let k = global_cluster(chunk)
+      - count how often B is also present in those A-chunks per k (conditional presence rate)
+      - for chunks where A and B co-occur, count overlap by global cluster (k)
+
+    Outputs:
+      - cluster_overlap: list of clusters where A and B co-occur, with:
+          cluster_id, label_hint, count_chunks_together_in_theme,
+          cluster_texts (TOP-K preview chunks, display only)
+      - cluster_conditional_coupling:
+          A_cluster_<k>_B_presence_rate
+          A_cluster_<k>_A_without_B
+        plus theme_support = max presence rate over A's clusters
     """
     A = str(A)
     B = str(B)
-
-    a_chunk_map = concept_chunk_to_cluster.get(A, {})
-    b_chunk_map = concept_chunk_to_cluster.get(B, {})
+    cluster_top_chunks = cluster_top_chunks or {}
 
     a_in_cluster: Dict[int, int] = defaultdict(int)
     b_present_in_a_cluster: Dict[int, int] = defaultdict(int)
-    overlap_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    overlap_counts: Dict[int, int] = defaultdict(int)
 
     for chunk_id, concepts in chunk_to_concepts.items():
         if A not in concepts:
             continue
 
-        a_k = int(a_chunk_map.get(chunk_id, 0))
-        a_in_cluster[a_k] += 1
+        k = int(chunk_to_cluster.get(str(chunk_id), 0))
+        a_in_cluster[k] += 1
 
         if B in concepts:
-            b_present_in_a_cluster[a_k] += 1
-            b_k = int(b_chunk_map.get(chunk_id, 0))
-            overlap_counts[(a_k, b_k)] += 1
+            b_present_in_a_cluster[k] += 1
+            overlap_counts[k] += 1
 
+    # overlap list (clusters where A and B co-occur)
     overlap_list: List[Dict[str, Any]] = []
-    for (a_k, b_k), cnt in overlap_counts.items():
+    for k, cnt in overlap_counts.items():
         overlap_list.append(
             {
-                "A_cluster_id": a_k,
-                "A_label_hint": concept_cluster_label.get(A, {}).get(a_k, "misc"),
-                "B_cluster_id": b_k,
-                "B_label_hint": concept_cluster_label.get(B, {}).get(b_k, "misc"),
+                "cluster_id": k,
+                "label_hint": cluster_label.get(k, "misc"),
                 "count_chunks_together_in_theme": cnt,
+                # ✅ display only
+                "cluster_texts": cluster_top_chunks.get(k, []),
             }
         )
     overlap_list.sort(key=lambda x: -x["count_chunks_together_in_theme"])
 
+    # conditional coupling (per cluster where A appears)
     cond: Dict[str, Any] = {}
     theme_support = 0.0
-    for a_k, total in a_in_cluster.items():
-        present = b_present_in_a_cluster.get(a_k, 0)
+    for k, total in a_in_cluster.items():
+        present = b_present_in_a_cluster.get(k, 0)
         rate = (present / total) if total > 0 else 0.0
         without = total - present
-        cond[f"A_cluster_{a_k}_B_presence_rate"] = rate
-        cond[f"A_cluster_{a_k}_A_without_B"] = without
+        cond[f"A_cluster_{k}_B_presence_rate"] = rate
+        cond[f"A_cluster_{k}_A_without_B"] = without
         if rate > theme_support:
             theme_support = rate
 
@@ -448,6 +557,7 @@ def _compute_theme_coupling(
         "cluster_overlap": overlap_list,
         "cluster_conditional_coupling": cond,
     }
+
 
 
 def enrich_pairpackets_with_theme(
@@ -460,13 +570,20 @@ def enrich_pairpackets_with_theme(
 ) -> None:
     """
     Reads Step-1 pairpackets JSONL and writes a new JSONL with:
-      - theme_coupling filled
-      - confidence_features.theme_support set to max B_presence_rate_in_A_cluster over A clusters
+      - theme_coupling filled (using GLOBAL cluster_id per chunk)
+      - theme_coupling.cluster_overlap now includes cluster_texts (TOP-K preview chunks, display only)
+      - confidence_features.theme_support set to max B_presence_rate over A's clusters
     """
     from pathlib import Path
 
+    # chunk_id -> set(concept_id)
     chunk_to_concepts = _build_chunk_to_concepts(mentions_path)
-    concept_chunk_to_cluster, concept_cluster_label = _load_cluster_index(clusters_with_assignments_path)
+
+    # chunk_id -> global cluster_id, cluster_id -> label_hint, cluster_id -> top preview chunks (display only)
+    chunk_to_cluster, cluster_label, cluster_top_chunks = _load_cluster_index(
+        clusters_with_assignments_path,
+        top_k_chunks_per_cluster=2,
+    )
 
     pairs = read_jsonl(pairpackets_in_path)
     out: List[Dict[str, Any]] = []
@@ -474,7 +591,7 @@ def enrich_pairpackets_with_theme(
     total = len(pairs)
     print(f"Loaded pairpackets = {total}")
     print(f"Loaded chunks (concept sets) = {len(chunk_to_concepts)}")
-    print(f"Loaded cluster index concepts = {len(concept_chunk_to_cluster)}")
+    print(f"Loaded cluster index chunks = {len(chunk_to_cluster)}")
     print(f"Writing to: {pairpackets_out_path}")
 
     Path(pairpackets_out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -482,14 +599,15 @@ def enrich_pairpackets_with_theme(
     for i, rec in enumerate(pairs, 1):
         pair = rec.get("pair") or []
         if isinstance(pair, list) and len(pair) == 2:
-            A, B = pair[0], pair[1]
+            A, B = str(pair[0]), str(pair[1])
 
             theme = _compute_theme_coupling(
                 A,
                 B,
                 chunk_to_concepts=chunk_to_concepts,
-                concept_chunk_to_cluster=concept_chunk_to_cluster,
-                concept_cluster_label=concept_cluster_label,
+                chunk_to_cluster=chunk_to_cluster,
+                cluster_label=cluster_label,
+                cluster_top_chunks=cluster_top_chunks,
             )
             rec["theme_coupling"] = theme
 
@@ -497,11 +615,12 @@ def enrich_pairpackets_with_theme(
             if not isinstance(cf, dict):
                 cf = {}
                 rec["confidence_features"] = cf
-            cf["theme_support"] = float(theme["cluster_conditional_coupling"].get("theme_support", 0.0))
+
+            cf["theme_support"] = float(theme.get("cluster_conditional_coupling", {}).get("theme_support", 0.0))
 
         out.append(rec)
 
-        if progress_every and (i % progress_every == 0 or i == total):
+        if progress_every and (i == 1 or i % progress_every == 0 or i == total):
             print(f"[progress] {i}/{total}")
 
     write_jsonl(pairpackets_out_path, out)

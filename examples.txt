@@ -1,0 +1,58 @@
+# Concept-Level Evaluation
+## Given a course title, concept name, examples of chunks where the concept is mentioned, determine whether this concept is significant for the course
+
+# Triplet-Level Evaluation
+## Given a course title, concept - relation - concept, examples of EITHER chunks where they co-occur (OR chunks in the same cluster where they individually occur), determine whether the relationship is correct/justified based on the evidence, or if there should not be any relationship between them.
+
+# Role Evaluation (small-scale)
+## 50 samples; human eval; given a course title, a concept, a chunk, and the classified role -> is the role correct?
+
+# Subgraph-level Preference Evaluation
+## Given a baseline subgraph and the main method subgraph, which one is preferred
+### Provide the different chunks for the subgraph
+
+
+
+### clustering ###
+
+1) context_clusters.with_assignments.jsonl (output of global clustering)
+
+Each line = one global topic cluster (a “pile” of similar chunks).
+
+cluster_id: the ID of the topic pile.
+
+label_hint: an auto-made short name for what this pile is about.
+
+count_chunks: how many chunks are in this pile.
+
+chunk_ids: the IDs of all chunks that belong to this pile.
+
+chunks: just a few example chunks (preview texts) from the pile.
+
+Meaning: “These chunk texts are similar, so we grouped them into the same topic.”
+
+2) pairpackets.with_theme.jsonl (how pairpackets uses global clusters)
+
+Here clustering is used only inside theme_coupling.
+
+theme_coupling.cluster_overlap:
+Which global topic piles contain chunks where A and B appear together.
+
+cluster_id: which topic pile.
+
+label_hint: name of that pile.
+
+count_chunks_together_in_theme: how many “A+B together” chunks happened inside this pile.
+
+cluster_texts: a couple example chunks from that pile (preview).
+
+theme_coupling.cluster_conditional_coupling:
+For each topic pile where A appears, how often B also appears in that same pile.
+
+A_cluster_<k>_B_presence_rate:
+“When A shows up in topic pile k, what fraction of the time does B also show up?”
+
+A_cluster_<k>_A_without_B:
+“How many times A shows up in pile k without B?”
+
+theme_support: the best (max) presence rate across all piles (a single summary number).

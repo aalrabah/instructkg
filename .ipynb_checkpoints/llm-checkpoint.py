@@ -113,16 +113,17 @@ async def classify_concept_role_llm(
 
         out = parse_pydantic_from_llm_text(resp.output_text, RoleTaggerOutput)
         if not out:
-            return None
-
+            # ✅ Instead of returning None, return NA with empty snippet
+            logger.warning(f"Failed to parse role for concept='{concept}', defaulting to NA")
+            return {"role": "na", "snippet": ""}
 
         # keep your downstream keys: role + snippet
         return {"role": out.role, "snippet": out.snippet.strip()}
 
-
     except Exception as e:
         logger.warning(f"Role classification failed for concept='{concept}': {e}")
-        return None
+        # ✅ Return NA instead of None
+        return {"role": "na", "snippet": ""}
 
 
 # ----------------------------
@@ -152,7 +153,7 @@ async def extract_concepts_with_roles_from_chunks(
       "chunk_id": "...",
       "chunk_index": ...,
       "page_numbers": [...],
-      "role": "example" | "definition" | "assumption",
+      "role": "example" | "definition" | "assumption" | "none",
       "snippet": "..."
     }
     """
@@ -190,7 +191,7 @@ async def extract_concepts_with_roles_from_chunks(
                     "chunk_index": ch.get("chunk_index", idx),
                     "page_numbers": ch.get("page_numbers") or [],
                     "role": tag["role"].lower(),
-                    "snippet": tag["snippet"],
+                    "snippet": ch.get("text"),
                 }
             )
 
@@ -265,6 +266,7 @@ def build_concept_cards(
             "definition": "defined",
             "example": "example",
             "assumption": "assumed",
+            "na": "na",
         }
 
         buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -273,7 +275,7 @@ def build_concept_cards(
             buckets[bucket].append(m)
 
         usage_signals: Dict[str, Any] = {}
-        for bucket_name in ["defined", "example", "assumed"]:
+        for bucket_name in ["defined", "example", "assumed", "na"]:
             ev = buckets.get(bucket_name, [])
             usage_signals[bucket_name] = {
                 "count": len(ev),
