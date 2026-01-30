@@ -50,3 +50,6 @@ python main.py \
   --data-dir data/anlp \
   --out-dir out/anlp \
   --llm-model "meta-llama/Llama-3.1-8B-Instruct"
+
+
+LLM_PROVIDER=hf RELATION_DEBUG=1 RELATION_DEBUG_N=3 python main.py --steps ingest llm clustering pairpackets relations --data-dir data/sql --out-dir out/sql --llm-model "meta-llama/Llama-3.1-8B-Instruct" --batch-size 32 --concurrency 12
