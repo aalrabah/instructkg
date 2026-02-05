@@ -1,101 +1,157 @@
-from vllm import SamplingParams, LLM
+from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
-import json_repair
 from typing import List, Dict
+import json, json_repair
+import glob, os, argparse
+import numpy as np
 from tqdm import tqdm
 
-def batch_llm_inference(llm , messages_list: List[List[Dict]], schema: dict, temperature: float = 0.0, max_tokens: int = 2048) -> List[dict]:
-    """
-    Perform batch inference with structured output.
-    
-    Args:
-        llm: vLLM model
-        messages_list: List of message sequences (each is a list of message dicts)
-        schema: JSON schema for structured output
-        temperature: Sampling temperature
-        
-    Returns:
-        List of parsed JSON responses
-    """
-    sampling_params = SamplingParams(
-    max_tokens=max_tokens,
-    temperature=temperature,
-    top_p=0.95,
-    structured_outputs=StructuredOutputsParams(json=schema),
-    )
-        
-    responses = [r.outputs[0].text for r in llm.chat(messages_list, sampling_params, chat_template_kwargs={"include_reasoning": False})]
+from prompts import (
+    Output,
+    prompt_m1_concept_node_validity_ordinal,
+    prompt_m1_concept_triplet_accuracy_ordinal,
+)
 
-    # Parse all responses
-    parsed_responses = []
-    for response in responses:
+# --------------------------------------------------
+# LLM batch inference
+# --------------------------------------------------
+
+def batch_llm_inference(llm, messages_list, schema, temperature=0.0, max_tokens=2048):
+    params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        structured_outputs=StructuredOutputsParams(json=schema),
+    )
+
+    raw = llm.chat(messages_list, params, chat_template_kwargs={"include_reasoning": False})
+    outputs = []
+
+    for r in raw:
+        text = r.outputs[0].text
         try:
-            parsed = json_repair.loads(response)
-            parsed_responses.append(parsed)
-        except Exception as e:
-            print(f"Error parsing response: {e}")
-            print(f"Response text: {response.outputs[0].text}")
-            parsed_responses.append(None)
-    
-    return parsed_responses
+            json_output = json_repair.loads(text)
+            if (type(json_output) == list) and (type(json_output[-1]) == dict):
+                json_output = json_output[-1]
+            outputs.append(json_output)
+        except Exception:
+            outputs.append(None)
 
-def parse_arguments():
-    """
-    Parse command-line arguments.
-    
-    Returns:
-        Parsed arguments object
-    """
-    parser = argparse.ArgumentParser(
-        description="Retrieve & analyze interdisciplinary research."
-    )
-    parser.add_argument(
-        "--input_dir",
-        type=str,
-        default="outputs/main_method",
-        help="Path to directory with all results."
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="openai/gpt-oss-120b",
-        help="LLM model name or path."
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="comparison",
-        help="Path to output directory."
-    )
-    parser.add_argument(
-        "--temp",
-        type=float,
-        default=0.0,
-        help="Temperature for all LLM generation."
-    )
-    parser.add_argument(
-        "--skip_if_exists",
-        action="store_true",
-        help="Skip processing if output file already exists."
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=400,
-        help="Max number of samples to run."
-    )
+    return outputs
 
-    return parser.parse_args()
 
+# --------------------------------------------------
+# Metric evaluators
+# --------------------------------------------------
+
+def eval_node_significance(llm, data, course_name):
+    node_to_excerpts = {}
+
+    for item in data:
+        for side in ["A", "B"]:
+            node = item[side]["name"]
+            excerpts = [e["text"] for e in item["evidence_chunks"]]
+            node_to_excerpts.setdefault(node, []).extend(excerpts)
+
+    prompts = [
+        [{"role": "user",
+          "content": prompt_m1_concept_node_validity_ordinal(node, ex, course_name)}]
+        for node, ex in node_to_excerpts.items()
+    ]
+
+    outputs = batch_llm_inference(llm, prompts, Output.model_json_schema())
+    print(outputs[0])
+    scores = [o["score"] for o in outputs if ((isinstance(o, dict)) and ("score" in o))]
+
+    return float(np.mean(scores) / 2.0) if scores else None
+
+
+def eval_triplet_accuracy(llm, data, course_name):
+    prompts = []
+
+    for item in data:
+        edge = {
+            "source": item["A"]["name"],
+            "relation_type": item["relation"],
+            "target": item["B"]["name"],
+        }
+        excerpts = [e["text"] for e in item["evidence_chunks"]]
+
+        prompts.append([{
+            "role": "user",
+            "content": prompt_m1_concept_triplet_accuracy_ordinal(edge, excerpts, course_name)
+        }])
+
+    outputs = batch_llm_inference(llm, prompts, Output.model_json_schema())
+    print(outputs[0])
+    scores = [o["score"] for o in outputs if ((isinstance(o, dict)) and ("score" in o))]
+
+    return float(np.mean(scores) / 2.0) if scores else None
+
+
+# --------------------------------------------------
+# Main evaluation loop
+# --------------------------------------------------
 
 def main():
-    """Main execution function."""
-    args = parse_arguments()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_root", default="experiments_outputs")
+    parser.add_argument("--output_json", default="final_eval.json")
+    parser.add_argument("--model_name", default="openai/gpt-oss-120b")
+    args = parser.parse_args()
 
-    # Initialize vLLM model
-    print("Loading model...")
-    llm = LLM(model=args.model_name, tensor_parallel_size=1, max_model_len=16384, gpu_memory_utilization=0.9, max_num_seqs=400)
-    print("Model loaded.\n")
+    llm = LLM(
+        model=args.model_name,
+        max_model_len=131072,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.9,
+        max_num_seqs=400,
+    )
 
-    with open(os.path.join(args.input_dir, "relations_algo_llama3b.jsonl"), "r") as f:
-        results = json.load(f)
+    results = {
+        "anlp": {
+            "node_significance": {},
+            "triplet_accuracy": {}
+        },
+        "algo": {
+            "node_significance": {},
+            "triplet_accuracy": {}
+        },
+        "sql": {
+            "node_significance": {},
+            "triplet_accuracy": {}
+        }
+    }
+
+    for method in sorted(os.listdir(args.input_root)):
+        method_dir = os.path.join(args.input_root, method)
+        if not os.path.isdir(method_dir):
+            continue
+
+        for path in glob.glob(os.path.join(method_dir, "*.jsonl")):
+            fname = os.path.basename(path)
+            model = fname.split("_")[-1].replace(".jsonl", "")
+            course_code = fname.split("_")[2]
+
+            if course_code == 'algo':
+                course_name = "Efficient Algorithms and Intractable Problems"
+            elif course_code == 'anlp':
+                course_name = "Advanced Topics in Natural Language Processing"
+            elif course_code == 'sql':
+                course_name = "Database Systems"
+
+            with open(path) as f:
+                data = [json.loads(line) for line in f]
+
+            ns = eval_node_significance(llm, data, course_name)
+            ta = eval_triplet_accuracy(llm, data, course_name)
+
+            results[course_code]["node_significance"].setdefault(model, {})[method] = ns
+            results[course_code]["triplet_accuracy"].setdefault(model, {})[method] = ta
+
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Saved results → {args.output_json}")
+
+
+if __name__ == "__main__":
+    main()

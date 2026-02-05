@@ -7,42 +7,6 @@ from pydantic import BaseModel
 
 
 # -----------------------------
-# Data structures (inputs)
-# -----------------------------
-
-@dataclass(frozen=True)
-class Excerpt:
-    """
-    An excerpt from instructor-provided material.
-    excerpt_id: stable identifier (e.g., "lec03_p2_s5" or "hw1_solution_par3").
-    text: excerpt content (pre-trim upstream if very large).
-    """
-    excerpt_id: str
-    text: str
-
-
-@dataclass(frozen=True)
-class Edge:
-    """
-    A typed directed edge between two concept nodes.
-    relation_type must be one of: "depends_on" | "part_of"
-    """
-    source: str
-    relation_type: str  # "depends_on" | "part_of"
-    target: str
-
-
-@dataclass(frozen=True)
-class GraphOption:
-    """
-    A candidate graph/subgraph option for comparison tasks, or a single graph G for overall tasks.
-    """
-    option_id: str  # e.g., "Option #1", "Option #2", or "Graph G"
-    nodes: List[str]
-    edges: List[Edge]
-
-
-# -----------------------------
 # Formatting helpers
 # -----------------------------
 
@@ -94,31 +58,71 @@ class Output(BaseModel):
 # -----------------------------
 
 ORDINAL_0_2_NODE_RUBRIC = textwrap.dedent("""
-    Use the following 0–2 ordinal scale strictly (Concept Node validity/meaningfulness):
+    Use the following 0–2 ordinal scale strictly (Concept Node significance/validity):
 
-    0 = No, not at all (invalid OR not meaningful for this course based on excerpts)
-    1 = Somewhat (valid but not very meaningful / only weakly supported / marginal)
-    2 = Yes (both valid and meaningful; clearly supported by excerpts)
+    Definitions:
+    - "Significant/meaningful concept" = a critical educational concept that students should
+      be taught and be able to explain/use in this course (core topic, method, principle,
+      model, theorem, algorithm, technique, framework, key term).
+    - "Not meaningful for the course" includes logistical/admin/metadata items that do not
+      represent course content knowledge.
+
+    Clear examples:
+    - Meaningful (YES / likely 2 if supported): "recursion", "merge sort", "Bayes' theorem",
+      "photosynthesis", "supply and demand", "gradient descent", "constitutional amendments".
+    - Not meaningful (NO / likely 0 even if mentioned): instructor/TA names, office hours,
+      due dates, grading policy, course number, Zoom link, classroom location, required textbook ISBN,
+      "homework submission", "attendance", "Canvas", "midterm".
+
+    Scoring:
+    0 = Invalid OR not a course-content concept (logistics/metadata), OR clearly unrelated to course learning goals.
+    1 = Plausible course-content concept but weakly supported, too vague, overly broad, or ambiguous given excerpts.
+        (Use 1 when you cannot confirm significance from the excerpts.)
+    2 = Clearly a valid course-content concept AND clearly significant for the course, with strong excerpt support.
 
     Evidence policy:
     - Base your score ONLY on the provided excerpts and the node label.
-    - If evidence is insufficient or ambiguous, score 1 and state what is missing.
+    - If evidence is insufficient/ambiguous, score 1 and state what is missing.
     - Cite evidence by excerpt_id (avoid long quotations).
 """).strip()
 
-
 ORDINAL_0_2_TRIPLET_RUBRIC = textwrap.dedent("""
-    Use the following 0–2 ordinal scale strictly (Concept Triplet / Edge accuracy):
+    Use the following 0–2 ordinal scale strictly (Directed, typed edge accuracy):
 
-    0 = No (A and B should not be directly linked)
-    1 = Somewhat (A and B should be directly related, but the type and/or direction is different)
-    2 = Yes (A and B are directly related according to the edge type and direction shown)
+    You must judge TWO things:
+    (1) Whether A and B are directly related as course concepts, AND
+    (2) Whether the relation TYPE AND DIRECTION are correct.
+
+    Relation semantics (direction matters):
+    - depends_on: Comprehending A requires understanding B; B is a prerequisite of A. Students should learn/understand B BEFORE A.
+      (Read as: A depends_on B.)
+    - part_of: A is a subtopic/component of B. B contains/organizes A.
+      (Read as: A is part_of B.)
+
+    Clear examples (directional):
+    - Correct depends_on:
+      A="merge sort" depends_on B="recursion"  ✅ (merge sort relies on recursion ideas)
+      A="backpropagation" depends_on B="chain rule" ✅
+    - Incorrect depends_on (reversed):
+      A="recursion" depends_on B="merge sort" ❌ (direction reversed; recursion is more fundamental)
+    
+    - Correct part_of:
+      A="merge sort" part_of B="sorting algorithms" and relation part_of where A part_of B ✅
+      A="mitochondria" with B="cell" and relation part_of where A part_of B ✅
+    - Incorrect part_of (reversed):
+      A="sorting algorithms" part_of B="merge sort" ❌
+
+    Scoring:
+    0 = No: the proposed direct relationship is wrong OR not supported by excerpts.
+    1 = Somewhat: A and B are related, but the type and/or the direction is wrong or unclear from evidence.
+    2 = Yes: A and B are directly related AND the type AND direction match the excerpts.
 
     Evidence policy:
     - Base your score ONLY on the provided excerpts and the proposed edge.
-    - If evidence is insufficient or ambiguous, score 1 and state what is missing.
+    - If evidence is insufficient/ambiguous, score 1 and state what is missing.
     - Cite evidence by excerpt_id (avoid long quotations).
 """).strip()
+
 
 
 # -----------------------------
@@ -148,33 +152,46 @@ LIKERT_1_5_RUBRIC_COMMON = textwrap.dedent("""
 def prompt_m1_concept_node_validity_ordinal(
     node_label: str,
     excerpts: List[str],
+    course_name: str
 ) -> str:
-    """
-    Metric (1) Concept Node question (0–2):
-    "Is node A a valid, meaningful concept for your course...?"
-    """
     return textwrap.dedent(f"""
-        You are evaluating a single concept node extracted for a course knowledge graph.
+You are evaluating a single concept node extracted for a course knowledge graph.
 
-        Task:
-        Score whether the concept node is a valid, meaningful concept for the course,
-        based strictly on the instructor-provided excerpts.
+Course Title: {course_name}
 
-        Concept Node:
-        - A = "{node_label}"
+Goal:
+Decide whether the node is a SIGNIFICANT course-content concept:
+something students should be taught and should understand/use in this course.
 
-        {ORDINAL_0_2_NODE_RUBRIC}
+Important:
+- "Significant concept" means key educational concepts (topic, method, principle, theorem,
+    algorithm, framework, key technical term) for a course.
+- It does NOT mean logistics/admin/metadata (e.g., instructor name, due dates, office hours,
+    grading policy, LMS/Canvas, Zoom link).
+- It does NOT mean educational concepts that would typically fall under a different course/topic (e.g., "Constitution", mentioned in an example of text parsing, would NOT be a significant concept for an NLP course.)
 
-        Instructor-material excerpts (evidence base):
-        { _format_excerpts(excerpts) }
+Concept Node:
+- A = "{node_label}"
 
-        { _json_output_contract() }
+{ORDINAL_0_2_NODE_RUBRIC}
+
+Instructor-material excerpts (evidence base):
+{_format_excerpts(excerpts)}
+
+Requirements for your answer:
+- Output STRICT JSON only (no markdown).
+- Rationale must cite excerpt_id(s) as evidence (e.g., "[1]", "[3]").
+- If evidence is insufficient or ambiguous, score 1 and say what is missing.
+
+        {_json_output_contract()}
     """).strip()
 
 
+
 def prompt_m1_concept_triplet_accuracy_ordinal(
-    edge: Edge,
+    edge: dict,
     excerpts: List[str],
+    course_name: str
 ) -> str:
     """
     Metric (1) Concept Triplet question (0–2):
@@ -187,12 +204,14 @@ def prompt_m1_concept_triplet_accuracy_ordinal(
         Score whether the edge type and direction accurately reflect the conceptual relationship
         between the two concepts, based strictly on the instructor-provided excerpts.
 
+        Course Title: {course_name}
+
         Concept Triplet:
-        - A = "{edge.source}"
-        - relation = "{edge.relation_type}"  (allowed: depends_on, part_of)
-        - B = "{edge.target}"
+        - A = "{edge['source']}"
+        - relation = "{edge['relation_type']}"  (allowed: depends_on, part_of)
+        - B = "{edge['target']}"
         Interpreting relation types:
-        - depends_on: A is a prerequisite of B (A should be learned before B)
+        - depends_on: B is a prerequisite of A (B should be learned before A)
         - part_of:    B is a subtopic/component of A (A contains/organizes B)
 
         {ORDINAL_0_2_TRIPLET_RUBRIC}
