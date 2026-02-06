@@ -75,7 +75,7 @@ ORDINAL_0_2_NODE_RUBRIC = textwrap.dedent("""
       "homework submission", "attendance", "Canvas", "midterm".
 
     Scoring:
-    0 = Invalid OR not a course-content concept (logistics/metadata), OR clearly unrelated to course learning goals.
+    0 = Invalid OR not a course-content concept (logistics/metadata), OR clearly insignificant or unrelated to course learning goals.
     1 = Plausible course-content concept but weakly supported, too vague, overly broad, or ambiguous given excerpts.
         (Use 1 when you cannot confirm significance from the excerpts.)
     2 = Clearly a valid course-content concept AND clearly significant for the course, with strong excerpt support.
@@ -92,6 +92,8 @@ ORDINAL_0_2_TRIPLET_RUBRIC = textwrap.dedent("""
     You must judge TWO things:
     (1) Whether A and B are directly related as course concepts, AND
     (2) Whether the relation TYPE AND DIRECTION are correct.
+
+    If A and B should NOT be directly related, then the proposed relationship is INCORRECT (e.g., "mergesort", "machine learning" should not be directly related).
 
     Relation semantics (direction matters):
     - depends_on: Comprehending A requires understanding B; B is a prerequisite of A. Students should learn/understand B BEFORE A.
