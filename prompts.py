@@ -152,6 +152,9 @@ PAIR:
 A = "{A}"
 B = "{B}"
 
+ROLES:
+{ROLE_BLOCK}
+
 TEMPORAL / STATS:
 {TEMPORAL_BLOCK}
 

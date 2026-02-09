@@ -1,4 +1,19 @@
-# relation_judger.py (BATCHED VERSION + OPTION-B evidence + minimal debug)
+# relation_judger.py
+"""
+LLM-based relation judging from pairpackets.
+
+Reads:
+  - out/pairpackets.jsonl
+
+Writes:
+  - out/relations.jsonl
+
+Evidence selection:
+  1. If chunk_co_occurrence.count > 0 AND >= cluster count → use chunk evidence
+  2. Else if cluster_co_occurrence_with_different_chunks.count > 0 → use cluster evidence
+  3. Else → skip pair (no evidence)
+"""
+
 from __future__ import annotations
 
 import os
@@ -11,23 +26,24 @@ from adapters import get_llm_client
 from config import OUT_DIR, CONCURRENCY, LLM_MODEL
 from prompts import RELATION_JUDGMENT_PROMPT_TEMPLATE
 
-# ✅ normalize to underscores
+# Allowed relations
 ALLOWED_RELATIONS = {"depends_on", "part_of"}
 
 # Batch size for LLM calls
 BATCH_SIZE = int(os.getenv("RELATION_BATCH_SIZE", "8"))
 
-# ✅ cache client (prevents HF reload each batch)
+# Cache client
 _LLM_CLIENT = get_llm_client()
 
-# ✅ debug knobs (minimal)
+# Debug knobs
 DEBUG = os.getenv("RELATION_DEBUG", "0").strip() == "1"
-DEBUG_N = int(os.getenv("RELATION_DEBUG_N", "3"))  # print first N items per batch
+DEBUG_N = int(os.getenv("RELATION_DEBUG_N", "3"))
 
 
 # ---------------------------
-# File utilities (unchanged)
+# File utilities
 # ---------------------------
+
 def _ensure_out_dir() -> Path:
     out = Path(OUT_DIR)
     out.mkdir(parents=True, exist_ok=True)
@@ -79,7 +95,13 @@ def _extract_pair_from_output_record(rec: Dict[str, Any]) -> Optional[Tuple[str,
     return None
 
 
+def _normalize_pair(a: str, b: str) -> Tuple[str, str]:
+    """Normalize pair to (smaller, larger) alphabetically so (A,B) and (B,A) are treated the same."""
+    return (min(a, b), max(a, b))
+
+
 def _load_done_pairs(path: Path) -> set[Tuple[str, str]]:
+    """Load already-processed pairs, normalized so (A,B) and (B,A) are the same."""
     done: set[Tuple[str, str]] = set()
     if not path.exists():
         return done
@@ -92,15 +114,17 @@ def _load_done_pairs(path: Path) -> set[Tuple[str, str]]:
                 rec = json.loads(line)
                 pair = _extract_pair_from_output_record(rec)
                 if pair:
-                    done.add(pair)
+                    # Normalize: (A,B) and (B,A) are the same pair
+                    done.add(_normalize_pair(pair[0], pair[1]))
             except Exception:
                 continue
     return done
 
 
 # ---------------------------
-# Robust JSON extraction (unchanged)
+# JSON extraction
 # ---------------------------
+
 def _extract_first_json_object(text: str) -> str:
     text = (text or "").strip()
     if not text:
@@ -145,8 +169,9 @@ def _parse_llm_json(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------
-# PairPacket helpers
+# Helpers
 # ---------------------------
+
 def _lecture_id_from_chunk_id(chunk_id: str) -> str:
     s = str(chunk_id or "")
     if "__" in s:
@@ -178,140 +203,130 @@ def _infer_roles_from_pairpacket(pp: Dict[str, Any]) -> Tuple[str, str]:
         a_role = "Example"
     else:
         a_role = "NA"
-        for key in ("A_defined_mentions_B", "A_example_mentions_B"):
-            sup = (rge.get(key) or {}).get("support") or []
-            for item in sup:
-                if isinstance(item, dict) and item.get("A_role"):
-                    a_role = _normalize_role(item.get("A_role"))
-                    break
-            if a_role != "NA":
-                break
 
     if int(b_def) > 0:
         b_role = "Definition"
     else:
         b_role = "NA"
-        sup = (rge.get("B_defined_mentions_A") or {}).get("support") or []
-        for item in sup:
-            if isinstance(item, dict) and item.get("B_role"):
-                b_role = _normalize_role(item.get("B_role"))
-                break
 
     return a_role, b_role
 
 
-def _best_cluster_overlap(pp: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
-    tc = pp.get("theme_coupling") or {}
-    overlaps = tc.get("cluster_overlap") or []
-    best = None
-    best_n = 0
-    for o in overlaps:
-        if not isinstance(o, dict):
-            continue
-        n = int(o.get("count_chunks_together_in_theme") or 0)
-        if n > best_n:
-            best_n = n
-            best = o
-    return best_n, best
+# ---------------------------
+# Evidence selection (NEW)
+# ---------------------------
 
-
-def _select_evidence_chunks(pp: Dict[str, Any], *, max_items: int = 2) -> Tuple[str, List[Dict[str, Any]]]:
+def _select_evidence_chunks(pp: Dict[str, Any], *, max_items: int = 3) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
-    ✅ OPTION B:
-    - Compare co_occurrence.count_chunks_together vs best_cluster.count_chunks_together_in_theme
-    - Pick whichever is HIGHER (must have usable text)
-    - Else fallback to role_grounded supports
+    Select evidence based on:
+    1. If chunk_co_occurrence.count > 0 AND >= cluster count → CHUNK_CO_OCCURRENCE
+    2. Else if cluster count > 0 → CLUSTER_CO_OCCURRENCE
+    3. Else → NO_EVIDENCE (skip)
+    
+    Returns:
+        mode: str
+        evidence_chunks: List[Dict]
+        mode_info: Dict with counts and reason
     """
-
-    # --- co-occ candidate
-    co = pp.get("co_occurrence") or {}
-    co_count = int(co.get("count_chunks_together") or 0)
-    co_top = co.get("top_chunks") or []
-    co_chunks: List[Dict[str, Any]] = []
-    for ch in co_top[:max_items]:
-        if not isinstance(ch, dict):
-            continue
-        cid = str(ch.get("chunk_id") or "").strip()
-        if not cid:
-            continue
-        co_chunks.append({
-            "source": "co_occurrence",
-            "chunk_id": cid,
-            "lecture_id": _lecture_id_from_chunk_id(cid),
-            "page_numbers": ch.get("page_numbers") or [],
-            "text": ch.get("text") or "",
-        })
-
-    # --- cluster candidate
-    cluster_count, best_cluster = _best_cluster_overlap(pp)
-    cluster_chunks: List[Dict[str, Any]] = []
-    if best_cluster:
-        cluster_texts = best_cluster.get("cluster_texts") or []
-        for ct in cluster_texts[:max_items]:
-            if not isinstance(ct, dict):
+    
+    # Get chunk co-occurrence
+    chunk_cooc = pp.get("chunk_co_occurrence") or {}
+    chunk_count = int(chunk_cooc.get("count") or 0)
+    chunk_list = chunk_cooc.get("chunks") or []
+    
+    # Get cluster co-occurrence
+    cluster_cooc = pp.get("cluster_co_occurrence_with_different_chunks") or {}
+    cluster_count = int(cluster_cooc.get("count") or 0)
+    cluster_list = cluster_cooc.get("clusters") or []
+    
+    # Base mode info
+    mode_info = {
+        "chunk_co_occurrence_count": chunk_count,
+        "cluster_co_occurrence_count": cluster_count,
+    }
+    
+    # Decision logic
+    if chunk_count > 0:
+        # Use chunk co-occurrence evidence (A and B appear together in same chunk)
+        mode_info["reason"] = f"A and B co-occur in {chunk_count} chunk(s)"
+        
+        evidence: List[Dict[str, Any]] = []
+        for ch in chunk_list[:max_items]:
+            if not isinstance(ch, dict):
                 continue
-            cid = str(ct.get("chunk_id") or "").strip()
+            cid = str(ch.get("chunk_id") or "").strip()
             if not cid:
                 continue
-            cluster_chunks.append({
-                "source": "cluster",
+            evidence.append({
+                "source": "chunk_co_occurrence",
                 "chunk_id": cid,
                 "lecture_id": _lecture_id_from_chunk_id(cid),
-                "page_numbers": [],
-                "text": ct.get("text") or "",
+                "text": ch.get("text") or "",
             })
-
-    # ✅ pick higher count
-    if cluster_count > co_count and cluster_count > 0 and cluster_chunks:
-        return "CLUSTER_FALLBACK", cluster_chunks
-
-    if co_count > 0 and co_chunks:
-        return "CO_OCCURRENCE", co_chunks
-
-    # --- role grounded fallback
-    rge = pp.get("role_grounded_evidence") or {}
-    role_chunks: List[Dict[str, Any]] = []
-    for key in ("A_defined_mentions_B", "A_example_mentions_B", "B_defined_mentions_A"):
-        support = (rge.get(key) or {}).get("support") or []
-        for item in support:
-            if not isinstance(item, dict):
+        return "CHUNK_CO_OCCURRENCE", evidence, mode_info
+    
+    elif cluster_count > 0:
+        # Use cluster co-occurrence evidence (A and B in same cluster but different chunks)
+        mode_info["reason"] = f"A and B appear in different chunks within {cluster_count} shared cluster(s)"
+        
+        evidence: List[Dict[str, Any]] = []
+        
+        for cluster in cluster_list[:1]:  # Take first cluster (most relevant)
+            if not isinstance(cluster, dict):
                 continue
-            cid = str(item.get("chunk_id") or "").strip()
-            if not cid:
-                continue
-            role_chunks.append({
-                "source": "role_grounded",
-                "chunk_id": cid,
-                "lecture_id": _lecture_id_from_chunk_id(cid),
-                "page_numbers": item.get("page_numbers") or [],
-                "text": item.get("snippet") or item.get("text") or "",
-            })
-
-    # dedupe
-    seen = set()
-    unique = []
-    for ch in role_chunks:
-        if ch["chunk_id"] in seen:
-            continue
-        seen.add(ch["chunk_id"])
-        unique.append(ch)
-        if len(unique) >= max_items:
-            break
-
-    if unique:
-        return "ROLE_GROUNDED", unique
-
-    return "NO_EVIDENCE", []
+            
+            cluster_id = cluster.get("cluster_id")
+            label_hint = cluster.get("label_hint") or "misc"
+            
+            # Add A_chunks
+            a_chunks = cluster.get("A_chunks") or []
+            for ch in a_chunks[:max_items]:
+                if not isinstance(ch, dict):
+                    continue
+                cid = str(ch.get("chunk_id") or "").strip()
+                if not cid:
+                    continue
+                evidence.append({
+                    "source": "cluster_A",
+                    "cluster_id": cluster_id,
+                    "label_hint": label_hint,
+                    "chunk_id": cid,
+                    "lecture_id": _lecture_id_from_chunk_id(cid),
+                    "text": ch.get("text") or "",
+                })
+            
+            # Add B_chunks
+            b_chunks = cluster.get("B_chunks") or []
+            for ch in b_chunks[:max_items]:
+                if not isinstance(ch, dict):
+                    continue
+                cid = str(ch.get("chunk_id") or "").strip()
+                if not cid:
+                    continue
+                evidence.append({
+                    "source": "cluster_B",
+                    "cluster_id": cluster_id,
+                    "label_hint": label_hint,
+                    "chunk_id": cid,
+                    "lecture_id": _lecture_id_from_chunk_id(cid),
+                    "text": ch.get("text") or "",
+                })
+        
+        return "CLUSTER_CO_OCCURRENCE", evidence, mode_info
+    
+    else:
+        mode_info["reason"] = "no evidence available"
+        return "NO_EVIDENCE", [], mode_info
 
 
 # ---------------------------
 # Prompt building
 # ---------------------------
+
 def _format_temporal_block(pp: Dict[str, Any]) -> str:
     t = pp.get("temporal_order") or {}
     a0 = t.get("A_first_introduced_at") or {}
     b0 = t.get("B_first_introduced_at") or {}
-    # ✅ remove gap_lectures (you said not important)
 
     lines: List[str] = []
     if a0:
@@ -328,49 +343,97 @@ def _format_temporal_block(pp: Dict[str, Any]) -> str:
     return "\n".join(lines).strip() if lines else "- (no temporal info available)"
 
 
-def _format_mode_block(mode: str) -> str:
-    # keep minimal
-    return f'- mode = "{mode}"'
+def _format_mode_block(mode: str, mode_info: Dict[str, Any]) -> str:
+    lines = [
+        f'- mode = "{mode}"',
+        f'- chunk_co_occurrence_count = {mode_info.get("chunk_co_occurrence_count", 0)}',
+        f'- cluster_co_occurrence_count = {mode_info.get("cluster_co_occurrence_count", 0)}',
+        f'- reason = "{mode_info.get("reason", "")}"',
+    ]
+    return "\n".join(lines)
 
 
-def _format_evidence_block(evidence_chunks: List[Dict[str, Any]]) -> str:
+def _format_evidence_block(evidence_chunks: List[Dict[str, Any]], mode: str) -> str:
     if not evidence_chunks:
         return "- (no evidence chunks available)"
 
     lines: List[str] = []
-    for i, ch in enumerate(evidence_chunks, start=1):
-        cid = ch.get("chunk_id")
-        pages = ch.get("page_numbers") or []
-        txt = (ch.get("text") or "").strip()
-        lines.append(f"[{i}] chunk_id=\"{cid}\", page_numbers={pages}")
-        lines.append("TEXT:")
-        lines.append("<chunk>")
-        lines.append(txt)
-        lines.append("</chunk>")
+    
+    if mode == "CHUNK_CO_OCCURRENCE":
+        # A and B appear together in these chunks
+        for i, ch in enumerate(evidence_chunks, start=1):
+            cid = ch.get("chunk_id")
+            lecture_id = ch.get("lecture_id")
+            txt = (ch.get("text") or "").strip()
+            lines.append(f"[{i}] chunk_id=\"{cid}\", lecture_id=\"{lecture_id}\"")
+            lines.append("(A and B both appear in this chunk)")
+            lines.append("<chunk>")
+            lines.append(txt)
+            lines.append("</chunk>")
+            lines.append("")
+    
+    elif mode == "CLUSTER_CO_OCCURRENCE":
+        # A and B appear in different chunks but same cluster
+        a_chunks = [ch for ch in evidence_chunks if ch.get("source") == "cluster_A"]
+        b_chunks = [ch for ch in evidence_chunks if ch.get("source") == "cluster_B"]
+        
+        cluster_label = evidence_chunks[0].get("label_hint", "misc") if evidence_chunks else "misc"
+        lines.append(f"Cluster theme: \"{cluster_label}\"")
         lines.append("")
+        
+        lines.append("A appears in:")
+        for i, ch in enumerate(a_chunks, start=1):
+            cid = ch.get("chunk_id")
+            lecture_id = ch.get("lecture_id")
+            txt = (ch.get("text") or "").strip()
+            lines.append(f"[A-{i}] chunk_id=\"{cid}\", lecture_id=\"{lecture_id}\"")
+            lines.append("<chunk>")
+            lines.append(txt)
+            lines.append("</chunk>")
+            lines.append("")
+        
+        lines.append("B appears in:")
+        for i, ch in enumerate(b_chunks, start=1):
+            cid = ch.get("chunk_id")
+            lecture_id = ch.get("lecture_id")
+            txt = (ch.get("text") or "").strip()
+            lines.append(f"[B-{i}] chunk_id=\"{cid}\", lecture_id=\"{lecture_id}\"")
+            lines.append("<chunk>")
+            lines.append(txt)
+            lines.append("</chunk>")
+            lines.append("")
+    
     return "\n".join(lines).strip()
 
+def _format_role_block(a_role: str, b_role: str) -> str:
+    return f'- A_role = "{a_role}"\n- B_role = "{b_role}"'
 
-def build_prompt_from_pairpacket(pp: Dict[str, Any]) -> Tuple[str, str, str, str, List[Dict[str, Any]]]:
+
+def build_prompt_from_pairpacket(pp: Dict[str, Any]) -> Tuple[str, str, str, str, List[Dict[str, Any]], Dict[str, Any]]:
     pair = pp.get("pair") or ["", ""]
     A = str(pair[0]).strip()
     B = str(pair[1]).strip()
 
-    mode, evidence_chunks = _select_evidence_chunks(pp, max_items=2)
+    mode, evidence_chunks, mode_info = _select_evidence_chunks(pp, max_items=3)
+
+    # ✅ ADD THIS:
+    a_role, b_role = _infer_roles_from_pairpacket(pp)
 
     prompt = RELATION_JUDGMENT_PROMPT_TEMPLATE.format(
         A=A,
         B=B,
+        ROLE_BLOCK=_format_role_block(a_role, b_role),
         TEMPORAL_BLOCK=_format_temporal_block(pp),
-        MODE_BLOCK=_format_mode_block(mode),
-        EVIDENCE_BLOCK=_format_evidence_block(evidence_chunks),
+        MODE_BLOCK=_format_mode_block(mode, mode_info),
+        EVIDENCE_BLOCK=_format_evidence_block(evidence_chunks, mode),
     )
-    return A, B, mode, prompt, evidence_chunks
+    return A, B, mode, prompt, evidence_chunks, mode_info
 
 
 # ---------------------------
-# Batched LLM call (same structure, just uses cached client)
+# Batched LLM call
 # ---------------------------
+
 async def _call_llm_batch(prompts: List[str], *, model: str) -> List[str]:
     batch_input = [
         [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}]
@@ -397,7 +460,6 @@ def _normalize_relation(rel: Any) -> Optional[str]:
     s = str(rel).strip().lower()
     if not s or s in ("null", "none"):
         return None
-    # accept minor variations
     s = s.replace("-", "_").replace(" ", "_")
     return s if s in ALLOWED_RELATIONS else None
 
@@ -410,25 +472,27 @@ def _extract_relation_and_justification(llm_obj: Dict[str, Any]) -> Tuple[Option
 
 
 # ---------------------------
-# Batched processing (same flow)
+# Batched processing
 # ---------------------------
+
 async def judge_pairpacket_batch(
     pairpackets: List[Dict[str, Any]],
     *,
     model: str,
 ) -> List[Dict[str, Any]]:
     batch_data = []
+    
     for pp in pairpackets:
-        A, B, mode, prompt, evidence_chunks = build_prompt_from_pairpacket(pp)
+        A, B, mode, prompt, evidence_chunks, mode_info = build_prompt_from_pairpacket(pp)
+        
+        # Skip if no evidence
+        if mode == "NO_EVIDENCE":
+            continue
+        
         a_role, b_role = _infer_roles_from_pairpacket(pp)
 
-        # ✅ minimal debug: show whether evidence text exists
         if DEBUG and len(batch_data) < DEBUG_N:
-            co = pp.get("co_occurrence") or {}
-            co_count = int(co.get("count_chunks_together") or 0)
-            cluster_count, _ = _best_cluster_overlap(pp)
-            lens = [len((c.get("text") or "").strip()) for c in evidence_chunks]
-            print(f"[DEBUG pick] A={A} B={B} mode={mode} co_count={co_count} cluster_count={cluster_count} text_lens={lens}")
+            print(f"[DEBUG] A={A} B={B} mode={mode} chunk_count={mode_info.get('chunk_co_occurrence_count', 0)} cluster_count={mode_info.get('cluster_co_occurrence_count', 0)} reason={mode_info.get('reason', '')}")
 
         batch_data.append({
             "A": A,
@@ -436,10 +500,14 @@ async def judge_pairpacket_batch(
             "a_role": a_role,
             "b_role": b_role,
             "mode": mode,
+            "mode_info": mode_info,
             "prompt": prompt,
             "evidence_chunks": evidence_chunks,
             "temporal_order": pp.get("temporal_order") or {},
         })
+
+    if not batch_data:
+        return []
 
     prompts = [bd["prompt"] for bd in batch_data]
 
@@ -451,7 +519,6 @@ async def judge_pairpacket_batch(
 
     results = []
     for i, (bd, response_text) in enumerate(zip(batch_data, responses)):
-        # ✅ minimal debug: raw LLM output
         if DEBUG and i < DEBUG_N:
             print("=============== RAW LLM OUTPUT ===============")
             print(f"A={bd['A']} | B={bd['B']} | mode={bd['mode']}")
@@ -471,11 +538,12 @@ async def judge_pairpacket_batch(
             results.append({
                 "A": {"name": bd["A"], "role": bd["a_role"]},
                 "B": {"name": bd["B"], "role": bd["b_role"]},
-                "relation": relation,  # depends_on | part_of | null
+                "relation": relation,
                 "justification": justification,
                 "evidence_chunks": bd["evidence_chunks"],
                 "_meta": {
                     "mode": bd["mode"],
+                    "mode_info": bd["mode_info"],
                     "temporal_order": bd["temporal_order"],
                 },
             })
@@ -488,6 +556,7 @@ async def judge_pairpacket_batch(
                 "evidence_chunks": bd["evidence_chunks"],
                 "_meta": {
                     "mode": bd["mode"],
+                    "mode_info": bd["mode_info"],
                     "temporal_order": bd["temporal_order"],
                     "_error": str(e),
                 },
@@ -497,8 +566,9 @@ async def judge_pairpacket_batch(
 
 
 # ---------------------------
-# Main processing (unchanged)
+# Main processing
 # ---------------------------
+
 async def judge_pairpackets_file(
     in_path: str,
     *,
@@ -521,22 +591,54 @@ async def judge_pairpackets_file(
     if not isinstance(pairpackets, list):
         raise ValueError(f"Expected JSON array or JSONL list in {in_path}, got {type(pairpackets)}")
 
+    # Load pairs that were already processed in previous runs
     done = _load_done_pairs(out_file)
 
     todo = []
+    skipped_no_evidence = 0
+    skipped_duplicate_pair = 0
+    
+    # Track pairs we're going to process in THIS run (separate from already-done)
+    # This ensures (A,B) and (B,A) from the same input file don't both get processed
+    seen_this_run: set[Tuple[str, str]] = set()
+    
     for pp in pairpackets:
         pair = pp.get("pair") or ["", ""]
         A = str(pair[0]).strip()
         B = str(pair[1]).strip()
         if not A or not B:
             continue
-        if (A, B) in done:
+        
+        # Normalize pair so (A,B) and (B,A) are treated as the same
+        normalized = _normalize_pair(A, B)
+        
+        # Skip if already processed in a previous run
+        if normalized in done:
+            skipped_duplicate_pair += 1
             continue
+        
+        # Skip if we've already queued this pair (in either order) for THIS run
+        if normalized in seen_this_run:
+            skipped_duplicate_pair += 1
+            continue
+        
+        # Check if has evidence
+        chunk_count = (pp.get("chunk_co_occurrence") or {}).get("count", 0) or 0
+        cluster_count = (pp.get("cluster_co_occurrence_with_different_chunks") or {}).get("count", 0) or 0
+        
+        if chunk_count == 0 and cluster_count == 0:
+            skipped_no_evidence += 1
+            continue
+        
+        # Mark as seen for this run (prevents processing both (A,B) and (B,A))
+        seen_this_run.add(normalized)
         todo.append(pp)
 
     total = len(pairpackets)
     print(f"Loaded pairpackets = {total}")
-    print(f"Already done pairs = {len(done)}")
+    print(f"Already done pairs (previous runs) = {len(done)}")
+    print(f"Skipped (duplicate pair, same or reversed order) = {skipped_duplicate_pair}")
+    print(f"Skipped (no evidence) = {skipped_no_evidence}")
     print(f"Remaining to process = {len(todo)}")
     print(f"Writing to: {out_file}")
     print(f"Concurrency={conc} BatchSize={bs} Model={model_name}")
@@ -574,12 +676,13 @@ async def judge_pairpackets_file(
 
 
 # ---------------------------
-# CLI (unchanged)
+# CLI
 # ---------------------------
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="LLM-based relation judging from pairpackets.jsonl (BATCHED)")
+    parser = argparse.ArgumentParser(description="LLM-based relation judging from pairpackets.jsonl")
     parser.add_argument("--in", dest="in_path", default=str(Path(OUT_DIR) / "pairpackets.jsonl"))
     parser.add_argument("--out", dest="out_path", default=None)
     parser.add_argument("--model", default=None)

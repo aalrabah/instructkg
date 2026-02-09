@@ -5,7 +5,7 @@ import os
 import asyncio
 import threading
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Union, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Union
 
 SENTINEL_MODEL = "concepts-default"
 
@@ -64,8 +64,8 @@ def _resolve_model(provider: str, requested_model: str) -> str:
     if provider == "gemini":
         return os.getenv("GEMINI_CONCEPTS_MODEL", "gemini-1.5-pro")
 
-    # HF/local
-    if provider in ("hf", "huggingface", "local"):
+    # HF/local/vllm
+    if provider in ("hf", "huggingface", "local", "vllm"):
         return os.getenv("HF_CONCEPTS_MODEL", os.getenv("LLM_MODEL", "qwen7b"))
 
     return requested_model or SENTINEL_MODEL
@@ -190,18 +190,211 @@ class AnthropicCompatClient:
 
 
 # -----------------------
-# Hugging Face Local (compatible)
+# vLLM Local Engine (NEW - replaces HuggingFace transformers)
+# -----------------------
+class _VLLMLocalEngine:
+    """
+    vLLM-based inference engine for fast local inference.
+    """
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+        self.llm = None
+        self.tokenizer = None
+        self._load_lock = threading.Lock()
+        self._loaded = False
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+
+        with self._load_lock:
+            if self._loaded:
+                return
+
+            from vllm import LLM
+            from transformers import AutoTokenizer
+
+            hf_token = os.getenv("HF_TOKEN")
+            trust_remote_code = os.getenv("HF_TRUST_REMOTE_CODE", "1") == "1"
+            
+            # vLLM settings
+            gpu_memory_utilization = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9"))
+            max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
+            
+            print(f"[vLLM] Loading model: {self.model_id}")
+            print(f"[vLLM] GPU memory utilization: {gpu_memory_utilization}")
+            print(f"[vLLM] Max model length: {max_model_len}")
+            
+            self.llm = LLM(
+                model=self.model_id,
+                trust_remote_code=trust_remote_code,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                enforce_eager=True,  # Disable CUDA graphs to avoid async issues
+            )
+            
+            # Load tokenizer for chat template
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                token=hf_token,
+                trust_remote_code=trust_remote_code,
+            )
+            
+            self._loaded = True
+            print(f"[vLLM] Model loaded successfully!")
+
+    def format_prompt(self, system: str, user: str) -> str:
+        """Format prompt using chat template."""
+        self.load()
+        assert self.tokenizer is not None
+
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                msgs = [
+                    {"role": "system", "content": system or ""},
+                    {"role": "user", "content": user or ""},
+                ]
+                return self.tokenizer.apply_chat_template(
+                    msgs,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+
+        # Fallback format
+        return (
+            f"<|system|>\n{system}\n<|end|>\n"
+            f"<|user|>\n{user}\n<|end|>\n<|assistant|>\n"
+        )
+
+    def generate_many(self, system: str, users: List[str]) -> List[str]:
+        """Generate responses for multiple user inputs."""
+        self.load()
+        assert self.llm is not None
+
+        from vllm import SamplingParams
+
+        # Format all prompts
+        prompts = [self.format_prompt(system, u) for u in users]
+
+        # Sampling parameters from env
+        max_new_tokens = int(os.getenv("VLLM_MAX_NEW_TOKENS", os.getenv("HF_MAX_NEW_TOKENS", "512")))
+        temperature = float(os.getenv("VLLM_TEMPERATURE", os.getenv("HF_TEMPERATURE", "0.1")))
+        top_p = float(os.getenv("VLLM_TOP_P", os.getenv("HF_TOP_P", "1.0")))
+
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        # Generate (vLLM handles batching internally)
+        try:
+            outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
+        except Exception as e:
+            print(f"[vLLM] Generate failed: {e}")
+            return [""] * len(users)
+
+        # Extract generated text
+        results: List[str] = []
+        for output in outputs:
+            generated_text = output.outputs[0].text.strip()
+            results.append(generated_text)
+
+        return results
+
+    def generate(self, system: str, user: str) -> str:
+        """Generate response for single user input."""
+        outs = self.generate_many(system, [user])
+        return outs[0] if outs else ""
+
+
+class _VLLMResponses:
+    def __init__(self, provider_name: str):
+        self._provider = provider_name
+        self._engine: Optional[_VLLMLocalEngine] = None
+        self._model_id: Optional[str] = None
+
+    def _ensure_engine(self, requested_model: str) -> None:
+        resolved = _resolve_model(self._provider, requested_model)
+        model_id = HF_MODELS_MAP.get(resolved, resolved)
+
+        if self._engine is None or self._model_id != model_id:
+            self._model_id = model_id
+            self._engine = _VLLMLocalEngine(model_id)
+
+    async def create(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        input: Union[InputPayload, BatchInputPayload],
+        **kwargs,
+    ):
+        self._ensure_engine(model)
+        assert self._engine is not None
+
+        # Optional escape hatch: text_inputs=[...]
+        text_inputs = kwargs.pop("text_inputs", None)
+        if text_inputs is not None:
+            if isinstance(text_inputs, str):
+                user_texts = [text_inputs]
+            elif isinstance(text_inputs, list):
+                user_texts = [str(x) for x in text_inputs]
+            else:
+                user_texts = [str(text_inputs)]
+
+            def _run_text_inputs() -> List[str]:
+                return self._engine.generate_many(instructions, user_texts)
+
+            texts = await asyncio.to_thread(_run_text_inputs)
+            texts = [t.strip() for t in texts]
+            return SimpleNamespace(output_texts=texts, output_text=(texts[0] if texts else ""))
+
+        # Batch
+        if _is_batch_input(input):
+            payloads: BatchInputPayload = input  # type: ignore[assignment]
+            user_texts = [_extract_user_text(p) for p in payloads]
+
+            def _run_batch() -> List[str]:
+                return self._engine.generate_many(instructions, user_texts)
+
+            texts = await asyncio.to_thread(_run_batch)
+            texts = [t.strip() for t in texts]
+            return SimpleNamespace(output_texts=texts, output_text=(texts[0] if texts else ""))
+
+        # Single
+        payload: InputPayload = input  # type: ignore[assignment]
+        user_text = _extract_user_text(payload)
+
+        def _run_one() -> str:
+            return self._engine.generate(instructions, user_text)
+
+        text = await asyncio.to_thread(_run_one)
+        return SimpleNamespace(output_text=str(text).strip())
+
+
+class VLLMCompatClient:
+    def __init__(self):
+        self._provider = "vllm"
+        self.responses = _VLLMResponses(self._provider)
+
+
+# -----------------------
+# Legacy HuggingFace (kept for backwards compatibility)
 # -----------------------
 class _HFLocalEngine:
     """
-    Lazy-loaded transformers pipeline with safe locking.
+    Legacy HuggingFace transformers pipeline.
+    Use VLLMCompatClient for faster inference.
     """
     def __init__(self, model_id: str):
         self.model_id = model_id
         self.pipe = None
         self.tok = None
-        self._lock = threading.Lock()       # pipeline call lock (GPU not thread-safe)
-        self._load_lock = threading.Lock()  # model load lock (prevent double-load)
+        self._lock = threading.Lock()
+        self._load_lock = threading.Lock()
 
     def load(self) -> None:
         if self.pipe is not None:
@@ -214,7 +407,7 @@ class _HFLocalEngine:
             from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
             import torch
 
-            hf_token = os.getenv("HF_TOKEN")  # optional
+            hf_token = os.getenv("HF_TOKEN")
             trust_remote_code = os.getenv("HF_TRUST_REMOTE_CODE", "0") == "1"
 
             self.tok = AutoTokenizer.from_pretrained(
@@ -224,13 +417,11 @@ class _HFLocalEngine:
                 trust_remote_code=trust_remote_code,
             )
 
-            # decoder-only batching needs left padding
             try:
                 self.tok.padding_side = "left"
             except Exception:
                 pass
 
-            # ensure pad token exists
             if getattr(self.tok, "pad_token_id", None) is None and getattr(self.tok, "eos_token_id", None) is not None:
                 try:
                     self.tok.pad_token = self.tok.eos_token
@@ -241,7 +432,6 @@ class _HFLocalEngine:
             has_cuda = bool(getattr(torch, "cuda", None)) and torch.cuda.is_available()
             use_cpu = force_cpu or (not has_cuda)
 
-            # IMPORTANT: do NOT call .to(...) after device_map loads (avoids meta-tensor copy issues)
             if use_cpu:
                 mdl = AutoModelForCausalLM.from_pretrained(
                     self.model_id,
@@ -257,7 +447,7 @@ class _HFLocalEngine:
                     pad_token_id=getattr(self.tok, "eos_token_id", None),
                 )
             else:
-                device_map = os.getenv("HF_DEVICE_MAP", "auto")  # "auto" recommended
+                device_map = os.getenv("HF_DEVICE_MAP", "auto")
                 mdl = AutoModelForCausalLM.from_pretrained(
                     self.model_id,
                     device_map=device_map,
@@ -276,7 +466,6 @@ class _HFLocalEngine:
         self.load()
         assert self.tok is not None
 
-        # Use chat template if available (best for Llama/Qwen instruct)
         if hasattr(self.tok, "apply_chat_template"):
             try:
                 msgs = [
@@ -291,7 +480,6 @@ class _HFLocalEngine:
             except Exception:
                 pass
 
-        # fallback format
         return (
             f"<|system|>\n{system}\n<|end|>\n"
             f"<|user|>\n{user}\n<|end|>\n<|assistant|>\n"
@@ -308,7 +496,6 @@ class _HFLocalEngine:
         if outputs is None:
             return []
 
-        # pipeline returns list[dict] for batch, dict for single sometimes
         if isinstance(outputs, list):
             out: List[str] = []
             for item in outputs:
@@ -367,7 +554,7 @@ class _HFResponses:
 
         if self._engine is None or self._model_id != model_id:
             self._model_id = model_id
-            self._engine = _HFLocalEngine(model_id)  # <- positional (safe)
+            self._engine = _HFLocalEngine(model_id)
 
     async def create(
         self,
@@ -380,7 +567,6 @@ class _HFResponses:
         self._ensure_engine(model)
         assert self._engine is not None
 
-        # Optional HF-only escape hatch: text_inputs=[...]
         text_inputs = kwargs.pop("text_inputs", None)
         if text_inputs is not None:
             if isinstance(text_inputs, str):
@@ -397,9 +583,8 @@ class _HFResponses:
             texts = [t.strip() for t in texts]
             return SimpleNamespace(output_texts=texts, output_text=(texts[0] if texts else ""))
 
-        # Batch
         if _is_batch_input(input):
-            payloads: BatchInputPayload = input  # type: ignore[assignment]
+            payloads: BatchInputPayload = input
             user_texts = [_extract_user_text(p) for p in payloads]
 
             def _run_batch() -> List[str]:
@@ -409,8 +594,7 @@ class _HFResponses:
             texts = [t.strip() for t in texts]
             return SimpleNamespace(output_texts=texts, output_text=(texts[0] if texts else ""))
 
-        # Single
-        payload: InputPayload = input  # type: ignore[assignment]
+        payload: InputPayload = input
         user_text = _extract_user_text(payload)
 
         def _run_one() -> str:
@@ -436,7 +620,13 @@ def get_llm_client():
         return OpenAICompatClient()
     if provider in ("anthropic", "claude"):
         return AnthropicCompatClient()
+    if provider == "vllm":
+        return VLLMCompatClient()
     if provider in ("hf", "huggingface", "local"):
+        # Default to vLLM for hf/local providers (faster)
+        # Set LLM_PROVIDER=hf_legacy to use old transformers pipeline
+        return VLLMCompatClient()
+    if provider == "hf_legacy":
         return HFCompatClient()
 
     raise ValueError(f"Unsupported LLM_PROVIDER={provider}")
