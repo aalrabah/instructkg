@@ -1,5 +1,0 @@
-{"concept_id": "FULLY_CONNECTED_LAYER", "context_clusters": [{"cluster_id": 0, "count_chunks": 1, "label_hint": "misc"}]}
-{"concept_id": "GRADIENT_DESCENT", "context_clusters": [{"cluster_id": 0, "count_chunks": 1, "label_hint": "misc"}]}
-{"concept_id": "LINEAR_REGRESSION", "context_clusters": [{"cluster_id": 0, "count_chunks": 1, "label_hint": "misc"}]}
-{"concept_id": "MULTI_LAYER_PERCEPTRON", "context_clusters": [{"cluster_id": 0, "count_chunks": 1, "label_hint": "misc"}]}
-{"concept_id": "NEURON", "context_clusters": [{"cluster_id": 0, "count_chunks": 1, "label_hint": "misc"}]}

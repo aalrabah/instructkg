@@ -93,7 +93,9 @@ ORDINAL_0_2_TRIPLET_RUBRIC = textwrap.dedent("""
     (1) Whether A and B are directly related as course concepts, AND
     (2) Whether the relation TYPE AND DIRECTION are correct.
 
-    If A and B should NOT be directly related, then the proposed relationship is INCORRECT (e.g., "mergesort", "machine learning" should not be directly related).
+    The options for relation types are: depends_on, part_of, and None.
+
+    If A and B should NOT be directly related, then the proposed relationship should be "None" (e.g., "mergesort", "machine learning" should not be directly related).
 
     Relation semantics (direction matters):
     - depends_on: Comprehending A requires understanding B; B is a prerequisite of A. Students should learn/understand B BEFORE A.

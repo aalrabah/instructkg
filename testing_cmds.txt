@@ -106,3 +106,5 @@ python main.py --steps pairpackets relations --llm-model meta-llama/Llama-3.1-8B
 python main.py --steps pairpackets relations --llm-model meta-llama/Llama-3.2-3B-Instruct --concurrency 1 --batch-size 32 --out-dir sql_output_llama3b/
 python main.py --steps pairpackets relations --llm-model meta-llama/Llama-3.2-3B-Instruct --concurrency 1 --batch-size 32 --out-dir anlp_output_llama3b/
 python main.py --steps pairpackets relations --llm-model meta-llama/Llama-3.2-3B-Instruct --concurrency 1 --batch-size 32 --out-dir algo_output_llama3b/
+
+python eval.py --input_file /home/alrabah2/graphika/graphika/evaluation/relations_algo_llama8b (1).jsonl --course_name algo
