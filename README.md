@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="banner.png" alt="InstructKG" width="100%">
+<img src="banner.png" alt="InstructKG" width="50%">
 
 ### Automated Knowledge Graph Construction from Educational Content
 
