@@ -29,7 +29,7 @@ Given educational PDFs, InstructKG:
 
 - 📚 **For Students**: Understand which concepts to learn first and how topics connect
 - 👨‍🏫 **For Educators**: Automatically generate course roadmaps and learning paths
-- 🔬 **For Researchers**: Novel multi-LLM architecture for educational content understanding
+- 🔬 **For Instructors**: Course content insights and knowledge tracing
 
 ---
 
@@ -55,7 +55,7 @@ PDFs → Chunking → Concept Extraction → Clustering → Pair Generation → 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/InstructKG.git
+git clone https://github.com/aalrabah/InstructKG.git
 cd InstructKG
 
 # Install dependencies
